@@ -15,13 +15,15 @@ switched, and the correct word is retyped.
    same key sequence can be reconstructed as either its English or its
    Russian interpretation, using the standard QWERTY/ЙЦУКЕН physical mapping,
    without ever needing to know what layout was actually active while typing.
-2. On every word boundary (space, enter, punctuation, ...), it checks: is
-   what actually appeared on screen a real word in the currently active
-   language? If not, is the *other* interpretation a real word?
-3. If so: delete what was typed, switch the active layout via Hyprland's
+2. When you press Space after a word, it checks: is what actually appeared
+   on screen a real word in the currently active language? If not, is the
+   *other* interpretation a real word? (Other word endings - Enter, Tab,
+   punctuation, arrows - just reset the word without correcting it, since
+   by then the text may already be sent or the cursor moved.)
+3. If so: delete what was typed (including the space), switch the active layout via Hyprland's
    `switchxkblayout`, and retype the corrected word - via Wayland's virtual
-   keyboard protocol (`wtype`), so it never sees its own corrections as new
-   input.
+   keyboard protocol (`wtype`), followed by the space, so it never sees its
+   own corrections as new input.
 
 Dictionary lookups run against ~370k English and ~1.5M Russian word forms,
 compiled at build time into compact `fst` sets and embedded in the binary

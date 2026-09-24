@@ -171,11 +171,21 @@ impl Engine {
         }
 
         // Space, enter, tab, digits, punctuation, arrows, etc. all end the
-        // current word.
-        self.finalize(source_device);
+        // current word, but only a space is checked for a correction. By the
+        // time we see the key the application has already acted on it, so
+        // fixing the word means deleting and retyping that key too. That is
+        // safe for a space; Enter may already have sent a message, Tab moved
+        // focus and arrows moved the cursor away from the word.
+        if code == KeyCode::KEY_SPACE {
+            self.finalize(source_device, " ");
+        } else {
+            self.buffer.clear();
+        }
     }
 
-    fn finalize(&mut self, source_device: &str) {
+    /// `boundary` is the text the word-ending key has already put on screen
+    /// after the word; it is deleted and retyped along with the correction.
+    fn finalize(&mut self, source_device: &str, boundary: &str) {
         let keys = std::mem::take(&mut self.buffer);
         if keys.len() < self.cfg.general.min_word_length {
             return;
@@ -216,7 +226,8 @@ impl Engine {
         let corrected = apply_case_pattern(typed_word, other_word);
         tracing::info!(from = %typed_word, to = %corrected, "autocorrecting keyboard layout");
 
-        if let Err(e) = typer::correct_word(keys.len(), &corrected) {
+        let backspaces = keys.len() + boundary.chars().count();
+        if let Err(e) = typer::correct_word(backspaces, &format!("{corrected}{boundary}")) {
             tracing::warn!("failed to retype corrected word: {e:#}");
             return;
         }
