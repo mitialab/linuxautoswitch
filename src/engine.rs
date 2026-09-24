@@ -105,30 +105,31 @@ impl Engine {
     }
 
     /// `value`: 0 = key up, 1 = key down, 2 = autorepeat.
+    ///
+    /// Autorepeat is handled like a key-down: a held letter or Backspace
+    /// keeps typing or deleting on screen, so the buffer has to follow it.
     pub fn handle_key(&mut self, source_device: &str, code: KeyCode, value: i32) {
-        if value == 2 {
-            return; // autorepeat doesn't add new characters we care about
-        }
+        let held = value != 0;
 
         match code {
             KeyCode::KEY_LEFTSHIFT => {
-                self.shift_l = value == 1;
+                self.shift_l = held;
                 return;
             }
             KeyCode::KEY_RIGHTSHIFT => {
-                self.shift_r = value == 1;
+                self.shift_r = held;
                 return;
             }
             KeyCode::KEY_LEFTCTRL | KeyCode::KEY_RIGHTCTRL => {
-                self.ctrl = value == 1;
+                self.ctrl = held;
                 return;
             }
             KeyCode::KEY_LEFTALT | KeyCode::KEY_RIGHTALT => {
-                self.alt = value == 1;
+                self.alt = held;
                 return;
             }
             KeyCode::KEY_LEFTMETA | KeyCode::KEY_RIGHTMETA => {
-                self.meta = value == 1;
+                self.meta = held;
                 return;
             }
             KeyCode::KEY_CAPSLOCK => {
@@ -140,8 +141,8 @@ impl Engine {
             _ => {}
         }
 
-        if value != 1 {
-            return; // everything below only reacts to key-down
+        if !held {
+            return; // everything below only reacts to key-down and autorepeat
         }
 
         if !self.cfg.general.enabled || self.excluded {
@@ -352,6 +353,45 @@ fn apply_case_pattern(source: &str, target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DOWN: i32 = 1;
+    const REPEAT: i32 = 2;
+
+    #[test]
+    fn autorepeat_letter_extends_word() {
+        let mut engine = Engine::new(Config::default());
+        engine.handle_key("kbd", KeyCode::KEY_G, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_G, REPEAT);
+        engine.handle_key("kbd", KeyCode::KEY_G, REPEAT);
+        assert_eq!(engine.buffer.len(), 3);
+    }
+
+    #[test]
+    fn autorepeat_backspace_keeps_deleting() {
+        let mut engine = Engine::new(Config::default());
+        for code in [
+            KeyCode::KEY_G,
+            KeyCode::KEY_H,
+            KeyCode::KEY_B,
+            KeyCode::KEY_D,
+        ] {
+            engine.handle_key("kbd", code, DOWN);
+        }
+        engine.handle_key("kbd", KeyCode::KEY_BACKSPACE, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_BACKSPACE, REPEAT);
+        engine.handle_key("kbd", KeyCode::KEY_BACKSPACE, REPEAT);
+        assert_eq!(engine.buffer.len(), 1);
+    }
+
+    #[test]
+    fn autorepeat_modifier_stays_held() {
+        let mut engine = Engine::new(Config::default());
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, REPEAT);
+        assert!(engine.shift());
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, 0);
+        assert!(!engine.shift());
+    }
 
     #[test]
     fn case_pattern_all_caps() {
