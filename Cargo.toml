@@ -17,3 +17,16 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [build-dependencies]
 fst = "0.4.7"
+
+# build.rs compiles ~1.9M dictionary words into fst sets on every rebuild;
+# an unoptimized build script makes that step several times slower.
+[profile.dev.build-override]
+opt-level = 3
+
+[profile.release.build-override]
+opt-level = 3
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

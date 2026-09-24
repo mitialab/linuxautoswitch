@@ -96,9 +96,10 @@ pub enum HyprEvent {
 }
 
 /// Spawns a background thread that connects to Hyprland's event socket and
-/// forwards the events we care about. Reconnects automatically (e.g. across
-/// a Hyprland restart).
-pub fn listen(tx: Sender<HyprEvent>) {
+/// forwards the events we care about, converted into the caller's event
+/// type so they can share one channel. Reconnects automatically (e.g.
+/// across a Hyprland restart).
+pub fn listen<T: From<HyprEvent> + Send + 'static>(tx: Sender<T>) {
     thread::spawn(move || {
         loop {
             if let Err(e) = connect_and_listen(&tx) {
@@ -109,7 +110,7 @@ pub fn listen(tx: Sender<HyprEvent>) {
     });
 }
 
-fn connect_and_listen(tx: &Sender<HyprEvent>) -> Result<()> {
+fn connect_and_listen<T: From<HyprEvent>>(tx: &Sender<T>) -> Result<()> {
     let path = event_socket_path()?;
     let stream =
         UnixStream::connect(&path).with_context(|| format!("connecting to {}", path.display()))?;
@@ -121,7 +122,7 @@ fn connect_and_listen(tx: &Sender<HyprEvent>) -> Result<()> {
             // payload is "CLASS,TITLE" - title itself may contain commas, so
             // only split off the first field.
             let class = rest.split(',').next().unwrap_or("").to_string();
-            if tx.send(HyprEvent::ActiveWindow { class }).is_err() {
+            if tx.send(HyprEvent::ActiveWindow { class }.into()).is_err() {
                 return Ok(());
             }
         } else if let Some(rest) = line.strip_prefix("activelayout>>") {
@@ -129,7 +130,7 @@ fn connect_and_listen(tx: &Sender<HyprEvent>) -> Result<()> {
             let keyboard = parts.next().unwrap_or("").to_string();
             let layout = parts.next().unwrap_or("").to_string();
             if tx
-                .send(HyprEvent::ActiveLayout { keyboard, layout })
+                .send(HyprEvent::ActiveLayout { keyboard, layout }.into())
                 .is_err()
             {
                 return Ok(());

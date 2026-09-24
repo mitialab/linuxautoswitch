@@ -24,13 +24,31 @@ pub struct Engine {
     meta: bool,
     capslock: bool,
     current_class: String,
+    /// Cached `excluded_classes` check for `current_class`, refreshed only
+    /// when focus changes rather than on every keystroke.
+    excluded: bool,
     /// Hyprland keyboard device name -> last known active language.
     device_lang: HashMap<String, Lang>,
     keyboards: Vec<hypr::KeyboardDevice>,
+    /// evdev device name -> resolved Hyprland device name. The keyboard list
+    /// is fixed after startup, so each name only has to be resolved once.
+    resolved_devices: HashMap<String, Option<String>>,
 }
 
 impl Engine {
-    pub fn new(cfg: Config) -> Self {
+    pub fn new(mut cfg: Config) -> Self {
+        // Lowercase every case-insensitive matcher once up front so the
+        // comparisons below don't allocate.
+        for list in [
+            &mut cfg.general.excluded_classes,
+            &mut cfg.layouts.english_match,
+            &mut cfg.layouts.russian_match,
+        ] {
+            for s in list.iter_mut() {
+                *s = s.to_lowercase();
+            }
+        }
+
         let keyboards = hypr::get_keyboards().unwrap_or_else(|e| {
             tracing::warn!("could not query hyprctl devices at startup: {e:#}");
             Vec::new()
@@ -45,6 +63,7 @@ impl Engine {
             .ok()
             .flatten()
             .unwrap_or_default();
+        let excluded = is_excluded(&current_class, &cfg);
 
         Self {
             cfg,
@@ -56,8 +75,10 @@ impl Engine {
             meta: false,
             capslock: false,
             current_class,
+            excluded,
             device_lang,
             keyboards,
+            resolved_devices: HashMap::new(),
         }
     }
 
@@ -69,6 +90,7 @@ impl Engine {
         match ev {
             hypr::HyprEvent::ActiveWindow { class } => {
                 if class != self.current_class {
+                    self.excluded = is_excluded(&class, &self.cfg);
                     self.current_class = class;
                     self.buffer.clear();
                 }
@@ -122,7 +144,7 @@ impl Engine {
             return; // everything below only reacts to key-down
         }
 
-        if !self.cfg.general.enabled || self.is_excluded() {
+        if !self.cfg.general.enabled || self.excluded {
             self.buffer.clear();
             return;
         }
@@ -153,25 +175,14 @@ impl Engine {
         self.finalize(source_device);
     }
 
-    fn is_excluded(&self) -> bool {
-        if self.current_class.is_empty() {
-            return false;
-        }
-        let class = self.current_class.to_lowercase();
-        self.cfg
-            .general
-            .excluded_classes
-            .iter()
-            .any(|c| c.to_lowercase() == class)
-    }
-
     fn finalize(&mut self, source_device: &str) {
         let keys = std::mem::take(&mut self.buffer);
         if keys.len() < self.cfg.general.min_word_length {
             return;
         }
 
-        let Some(current_lang) = self.lang_for_device(source_device) else {
+        let device_name = self.resolve_hypr_device_name(source_device);
+        let Some(current_lang) = self.lang_for_device(device_name.as_deref()) else {
             tracing::debug!("no known active layout yet, skipping correction check");
             return;
         };
@@ -210,7 +221,7 @@ impl Engine {
             return;
         }
 
-        match self.resolve_hypr_device_name(source_device) {
+        match device_name {
             Some(device_name) => {
                 let index = match other_lang {
                     Lang::En => self.cfg.layouts.english_index,
@@ -230,9 +241,9 @@ impl Engine {
         }
     }
 
-    fn lang_for_device(&self, source_device: &str) -> Option<Lang> {
-        if let Some(name) = self.resolve_hypr_device_name(source_device)
-            && let Some(lang) = self.device_lang.get(&name)
+    fn lang_for_device(&self, device_name: Option<&str>) -> Option<Lang> {
+        if let Some(name) = device_name
+            && let Some(lang) = self.device_lang.get(name)
         {
             return Some(*lang);
         }
@@ -244,10 +255,20 @@ impl Engine {
     /// Hyprland slugifies libinput device names (lowercase, spaces -> `-`)
     /// for its own device identifiers; evdev gives us the human-readable
     /// name. Reproduce that transform to match them up.
-    fn resolve_hypr_device_name(&self, evdev_name: &str) -> Option<String> {
+    fn resolve_hypr_device_name(&mut self, evdev_name: &str) -> Option<String> {
         if let Some(o) = &self.cfg.hypr.device_name_override {
             return Some(o.clone());
         }
+        if let Some(cached) = self.resolved_devices.get(evdev_name) {
+            return cached.clone();
+        }
+        let resolved = self.match_hypr_device_name(evdev_name);
+        self.resolved_devices
+            .insert(evdev_name.to_string(), resolved.clone());
+        resolved
+    }
+
+    fn match_hypr_device_name(&self, evdev_name: &str) -> Option<String> {
         let slug = evdev_name.to_lowercase().replace(' ', "-");
         if let Some(kb) = self
             .keyboards
@@ -264,13 +285,25 @@ impl Engine {
     }
 }
 
+/// `cfg.general.excluded_classes` must already be lowercased (see
+/// `Engine::new`).
+fn is_excluded(class: &str, cfg: &Config) -> bool {
+    if class.is_empty() {
+        return false;
+    }
+    let class = class.to_lowercase();
+    cfg.general.excluded_classes.contains(&class)
+}
+
+/// The `cfg.layouts` matchers must already be lowercased (see
+/// `Engine::new`).
 fn detect_lang(desc: &str, cfg: &Config) -> Option<Lang> {
     let d = desc.to_lowercase();
     if cfg
         .layouts
         .english_match
         .iter()
-        .any(|m| d.contains(&m.to_lowercase()))
+        .any(|m| d.contains(m.as_str()))
     {
         return Some(Lang::En);
     }
@@ -278,7 +311,7 @@ fn detect_lang(desc: &str, cfg: &Config) -> Option<Lang> {
         .layouts
         .russian_match
         .iter()
-        .any(|m| d.contains(&m.to_lowercase()))
+        .any(|m| d.contains(m.as_str()))
     {
         return Some(Lang::Ru);
     }
