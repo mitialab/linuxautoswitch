@@ -1,0 +1,45 @@
+# linuxautoswitch config
+# Copy to $XDG_CONFIG_HOME/linuxautoswitch/config.toml (usually
+# ~/.config/linuxautoswitch/config.toml) and edit as needed.
+# Every field below is optional; anything you omit falls back to these
+# built-in defaults.
+
+[general]
+enabled = true
+
+# Words shorter than this are never auto-corrected - short strings are too
+# likely to produce a spurious dictionary match in one language or the
+# other.
+min_word_length = 3
+
+# Window classes (as reported by `hyprctl activewindow`) that are never
+# touched: terminals, password managers, anywhere retyping text would be
+# dangerous or where non-language text (commands, passwords) is normal.
+# Run `hyprctl activewindow` while focused on an app to find its class.
+excluded_classes = [
+  "kitty",
+  "foot",
+  "Alacritty",
+  "wezterm",
+  "org.keepassxc.KeePassXC",
+  "1Password",
+  "Bitwarden",
+]
+
+[layouts]
+# Substrings (case-insensitive) matched against Hyprland's `active_keymap`
+# description (see `hyprctl devices`) to recognize each layout.
+english_match = ["English"]
+russian_match = ["Russian"]
+
+# Index of each layout in your Hyprland `kb_layout` list (0-based), used
+# when switching. E.g. with `kb_layout = us,ru` in your Hyprland config:
+english_index = 0
+russian_index = 1
+
+[hypr]
+# Force a specific Hyprland keyboard device name instead of auto-detecting
+# it from the physical device name. Only needed with multiple keyboards, or
+# if auto-detection picks the wrong one. Find the right value with:
+#   hyprctl devices | grep -A2 Keyboard
+# device_name_override = "at-translated-set-2-keyboard"
