@@ -14,14 +14,40 @@ struct TypedKey {
     capslock: bool,
 }
 
+/// One bit per physical modifier key, so releasing one side of a pair
+/// (e.g. right Ctrl) doesn't clear the other side while it's still held.
+const LEFT_SHIFT: u8 = 1 << 0;
+const RIGHT_SHIFT: u8 = 1 << 1;
+const LEFT_CTRL: u8 = 1 << 2;
+const RIGHT_CTRL: u8 = 1 << 3;
+const LEFT_ALT: u8 = 1 << 4;
+const RIGHT_ALT: u8 = 1 << 5;
+const LEFT_META: u8 = 1 << 6;
+const RIGHT_META: u8 = 1 << 7;
+
+const SHIFT: u8 = LEFT_SHIFT | RIGHT_SHIFT;
+/// Modifiers that turn a keypress into a shortcut rather than text.
+const SHORTCUT: u8 = LEFT_CTRL | RIGHT_CTRL | LEFT_ALT | RIGHT_ALT | LEFT_META | RIGHT_META;
+
+fn modifier_bit(code: KeyCode) -> Option<u8> {
+    Some(match code {
+        KeyCode::KEY_LEFTSHIFT => LEFT_SHIFT,
+        KeyCode::KEY_RIGHTSHIFT => RIGHT_SHIFT,
+        KeyCode::KEY_LEFTCTRL => LEFT_CTRL,
+        KeyCode::KEY_RIGHTCTRL => RIGHT_CTRL,
+        KeyCode::KEY_LEFTALT => LEFT_ALT,
+        KeyCode::KEY_RIGHTALT => RIGHT_ALT,
+        KeyCode::KEY_LEFTMETA => LEFT_META,
+        KeyCode::KEY_RIGHTMETA => RIGHT_META,
+        _ => return None,
+    })
+}
+
 pub struct Engine {
     cfg: Config,
     buffer: Vec<TypedKey>,
-    shift_l: bool,
-    shift_r: bool,
-    ctrl: bool,
-    alt: bool,
-    meta: bool,
+    /// Currently held modifier keys, as `LEFT_SHIFT | ...` bits.
+    modifiers: u8,
     capslock: bool,
     current_class: String,
     /// Cached `excluded_classes` check for `current_class`, refreshed only
@@ -68,11 +94,7 @@ impl Engine {
         Self {
             cfg,
             buffer: Vec::new(),
-            shift_l: false,
-            shift_r: false,
-            ctrl: false,
-            alt: false,
-            meta: false,
+            modifiers: 0,
             capslock: false,
             current_class,
             excluded,
@@ -83,7 +105,7 @@ impl Engine {
     }
 
     fn shift(&self) -> bool {
-        self.shift_l || self.shift_r
+        self.modifiers & SHIFT != 0
     }
 
     pub fn handle_hypr(&mut self, ev: hypr::HyprEvent) {
@@ -111,34 +133,19 @@ impl Engine {
     pub fn handle_key(&mut self, source_device: &str, code: KeyCode, value: i32) {
         let held = value != 0;
 
-        match code {
-            KeyCode::KEY_LEFTSHIFT => {
-                self.shift_l = held;
-                return;
+        if let Some(bit) = modifier_bit(code) {
+            if held {
+                self.modifiers |= bit;
+            } else {
+                self.modifiers &= !bit;
             }
-            KeyCode::KEY_RIGHTSHIFT => {
-                self.shift_r = held;
-                return;
+            return;
+        }
+        if code == KeyCode::KEY_CAPSLOCK {
+            if value == 1 {
+                self.capslock = !self.capslock;
             }
-            KeyCode::KEY_LEFTCTRL | KeyCode::KEY_RIGHTCTRL => {
-                self.ctrl = held;
-                return;
-            }
-            KeyCode::KEY_LEFTALT | KeyCode::KEY_RIGHTALT => {
-                self.alt = held;
-                return;
-            }
-            KeyCode::KEY_LEFTMETA | KeyCode::KEY_RIGHTMETA => {
-                self.meta = held;
-                return;
-            }
-            KeyCode::KEY_CAPSLOCK => {
-                if value == 1 {
-                    self.capslock = !self.capslock;
-                }
-                return;
-            }
-            _ => {}
+            return;
         }
 
         if !held {
@@ -155,7 +162,7 @@ impl Engine {
             return;
         }
 
-        if self.ctrl || self.alt || self.meta {
+        if self.modifiers & SHORTCUT != 0 {
             // A shortcut (Ctrl+C, Alt+Tab, Super+...), not text. Whatever
             // was buffered before it is no longer contiguous on screen.
             self.buffer.clear();
@@ -381,6 +388,27 @@ mod tests {
         engine.handle_key("kbd", KeyCode::KEY_BACKSPACE, REPEAT);
         engine.handle_key("kbd", KeyCode::KEY_BACKSPACE, REPEAT);
         assert_eq!(engine.buffer.len(), 1);
+    }
+
+    #[test]
+    fn releasing_one_ctrl_keeps_the_other_held() {
+        let mut engine = Engine::new(Config::default());
+        engine.handle_key("kbd", KeyCode::KEY_G, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_LEFTCTRL, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTCTRL, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTCTRL, 0);
+        // Left Ctrl is still down, so this is Ctrl+H, not the letter h.
+        engine.handle_key("kbd", KeyCode::KEY_H, DOWN);
+        assert!(engine.buffer.is_empty());
+    }
+
+    #[test]
+    fn releasing_one_shift_keeps_the_other_held() {
+        let mut engine = Engine::new(Config::default());
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, 0);
+        assert!(engine.shift());
     }
 
     #[test]
