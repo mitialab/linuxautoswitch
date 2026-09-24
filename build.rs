@@ -1,27 +1,26 @@
 use fst::SetBuilder;
-use std::collections::BTreeSet;
 use std::env;
-use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter};
+use std::fs::{self, File};
+use std::io::BufWriter;
 use std::path::Path;
 
 fn build_fst(src: &str, dst: &Path) {
     println!("cargo:rerun-if-changed={src}");
 
-    let file = File::open(src).unwrap_or_else(|e| panic!("failed to open {src}: {e}"));
-    let reader = BufReader::new(file);
+    let text = fs::read_to_string(src).unwrap_or_else(|e| panic!("failed to read {src}: {e}"));
 
-    // Read into a sorted, deduplicated set first: `fst::SetBuilder` requires
-    // strictly increasing keys, and this keeps the build robust even if the
-    // source wordlist is ever edited out of order.
-    let mut words = BTreeSet::new();
-    for line in reader.lines() {
-        let line = line.unwrap_or_else(|e| panic!("failed to read {src}: {e}"));
-        let word = line.trim();
-        if !word.is_empty() {
-            words.insert(word.to_string());
-        }
-    }
+    // Sort and deduplicate first: `fst::SetBuilder` requires strictly
+    // increasing keys, and this keeps the build robust even if the source
+    // wordlist is ever edited out of order. Borrowing lines from one buffer
+    // avoids a heap allocation per word, and sorting an already-sorted list
+    // is close to linear.
+    let mut words: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .collect();
+    words.sort_unstable();
+    words.dedup();
 
     let out = File::create(dst).unwrap_or_else(|e| panic!("failed to create {dst:?}: {e}"));
     let mut builder = SetBuilder::new(BufWriter::new(out))

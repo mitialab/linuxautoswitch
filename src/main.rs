@@ -36,6 +36,12 @@ enum Event {
     Hypr(hypr::HyprEvent),
 }
 
+impl From<hypr::HyprEvent> for Event {
+    fn from(ev: hypr::HyprEvent) -> Self {
+        Event::Hypr(ev)
+    }
+}
+
 fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -69,18 +75,7 @@ fn main() -> anyhow::Result<()> {
     let (tx, rx) = mpsc::channel::<Event>();
 
     // Hyprland event socket -> Event channel.
-    {
-        let (hypr_tx, hypr_rx) = mpsc::channel();
-        hypr::listen(hypr_tx);
-        let tx = tx.clone();
-        thread::spawn(move || {
-            for ev in hypr_rx {
-                if tx.send(Event::Hypr(ev)).is_err() {
-                    break;
-                }
-            }
-        });
-    }
+    hypr::listen(tx.clone());
 
     // One reader thread per physical keyboard device.
     let mut watched = 0usize;
