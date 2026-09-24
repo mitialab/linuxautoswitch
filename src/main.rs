@@ -7,10 +7,12 @@ mod typer;
 
 use clap::Parser;
 use evdev::KeyCode;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::mpsc;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
+use std::time::Duration;
 use tracing_subscriber::prelude::*;
 
 /// Automatic EN/RU keyboard layout correction for Hyprland/Omarchy.
@@ -34,6 +36,8 @@ enum Event {
         value: i32,
     },
     Hypr(hypr::HyprEvent),
+    /// A new keyboard device was plugged in.
+    KeyboardsChanged,
 }
 
 impl From<hypr::HyprEvent> for Event {
@@ -65,6 +69,100 @@ fn is_keyboard(device: &evdev::Device) -> bool {
         .unwrap_or(false)
 }
 
+/// How often `/dev/input` is re-scanned for newly plugged-in keyboards.
+const DEVICE_SCAN_INTERVAL: Duration = Duration::from_secs(2);
+
+/// `/dev/input/event*` nodes that have already been examined (keyboards and
+/// other devices alike), so each new node is only opened once.
+type Seen = Arc<Mutex<HashSet<PathBuf>>>;
+
+/// Opens every input device that appeared since the last scan and starts a
+/// reader thread for each new keyboard. Returns how many were started.
+fn scan_devices(seen: &Seen, tx: &Sender<Event>) -> usize {
+    let present: HashSet<PathBuf> = match std::fs::read_dir("/dev/input") {
+        Ok(dir) => dir
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("event"))
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!("could not list /dev/input: {e}");
+            return 0;
+        }
+    };
+    let new: Vec<PathBuf> = {
+        let mut seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
+        seen.retain(|path| present.contains(path));
+        present
+            .into_iter()
+            .filter(|path| seen.insert(path.clone()))
+            .collect()
+    };
+
+    let mut started = 0;
+    for path in new {
+        let device = match evdev::Device::open(&path) {
+            Ok(device) => device,
+            Err(e) => {
+                // udev may not have granted access to a brand-new node yet;
+                // try again on the next scan.
+                tracing::debug!(path = %path.display(), "could not open input device: {e}");
+                forget(seen, &path);
+                continue;
+            }
+        };
+        if is_keyboard(&device) {
+            watch_device(path, device, seen.clone(), tx.clone());
+            started += 1;
+        }
+    }
+    started
+}
+
+fn forget(seen: &Seen, path: &Path) {
+    seen.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(path);
+}
+
+/// Spawns a thread forwarding `device`'s key events until it's unplugged.
+fn watch_device(path: PathBuf, mut device: evdev::Device, seen: Seen, tx: Sender<Event>) {
+    let name: Arc<str> = Arc::from(device.name().unwrap_or("unknown-keyboard"));
+    tracing::info!(path = %path.display(), name = %name, "watching keyboard device");
+    thread::spawn(move || {
+        loop {
+            match device.fetch_events() {
+                Ok(events) => {
+                    for ev in events {
+                        if let evdev::EventSummary::Key(_, code, value) = ev.destructure()
+                            && tx
+                                .send(Event::Key {
+                                    device: name.clone(),
+                                    code,
+                                    value,
+                                })
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(name = %name, "device read error: {e}, no longer watching this device");
+                    // If the same node comes back (e.g. replugged), the next
+                    // scan picks it up again.
+                    forget(&seen, &path);
+                    return;
+                }
+            }
+        }
+    });
+}
+
 fn main() -> anyhow::Result<()> {
     init_logging();
     let args = Args::parse();
@@ -77,50 +175,22 @@ fn main() -> anyhow::Result<()> {
     // Hyprland event socket -> Event channel.
     hypr::listen(tx.clone());
 
-    // One reader thread per physical keyboard device.
-    let mut watched = 0usize;
-    for (path, device) in evdev::enumerate() {
-        if !is_keyboard(&device) {
-            continue;
-        }
-        let name: Arc<str> = Arc::from(device.name().unwrap_or("unknown-keyboard"));
-        tracing::info!(path = %path.display(), name = %name, "watching keyboard device");
-        let tx = tx.clone();
-        let mut device = device;
-        thread::spawn(move || {
-            loop {
-                match device.fetch_events() {
-                    Ok(events) => {
-                        for ev in events {
-                            if let evdev::EventSummary::Key(_, code, value) = ev.destructure()
-                                && tx
-                                    .send(Event::Key {
-                                        device: name.clone(),
-                                        code,
-                                        value,
-                                    })
-                                    .is_err()
-                            {
-                                return;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(name = %name, "device read error: {e}, no longer watching this device");
-                        return;
-                    }
-                }
-            }
-        });
-        watched += 1;
-    }
-    drop(tx);
-
-    if watched == 0 {
+    // One reader thread per physical keyboard device, including ones
+    // plugged in later.
+    let seen: Seen = Arc::default();
+    if scan_devices(&seen, &tx) == 0 {
         tracing::warn!(
             "no keyboard devices found under /dev/input - is this user in the `input` group?"
         );
     }
+    thread::spawn(move || {
+        loop {
+            thread::sleep(DEVICE_SCAN_INTERVAL);
+            if scan_devices(&seen, &tx) > 0 && tx.send(Event::KeyboardsChanged).is_err() {
+                return;
+            }
+        }
+    });
 
     let mut engine = engine::Engine::new(cfg);
     for event in rx {
@@ -131,6 +201,7 @@ fn main() -> anyhow::Result<()> {
                 value,
             } => engine.handle_key(&device, code, value),
             Event::Hypr(ev) => engine.handle_hypr(ev),
+            Event::KeyboardsChanged => engine.refresh_keyboards(),
         }
     }
 

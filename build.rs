@@ -1,4 +1,5 @@
 use fst::SetBuilder;
+use std::borrow::Cow;
 use std::env;
 use std::fs::{self, File};
 use std::io::BufWriter;
@@ -14,11 +15,14 @@ fn build_fst(src: &str, dst: &Path) {
     // wordlist is ever edited out of order. Borrowing lines from one buffer
     // avoids a heap allocation per word, and sorting an already-sorted list
     // is close to linear.
-    let mut words: Vec<&str> = text
-        .lines()
-        .map(str::trim)
-        .filter(|w| !w.is_empty())
-        .collect();
+    let mut words: Vec<Cow<str>> = Vec::new();
+    for word in text.lines().map(str::trim).filter(|w| !w.is_empty()) {
+        // Most people type Russian `ё` as `е`, so accept that spelling too.
+        if word.contains('ё') {
+            words.push(Cow::Owned(word.replace('ё', "е")));
+        }
+        words.push(Cow::Borrowed(word));
+    }
     words.sort_unstable();
     words.dedup();
 
@@ -27,7 +31,7 @@ fn build_fst(src: &str, dst: &Path) {
         .unwrap_or_else(|e| panic!("failed to start fst builder for {dst:?}: {e}"));
     for word in &words {
         builder
-            .insert(word)
+            .insert(word.as_bytes())
             .unwrap_or_else(|e| panic!("failed to insert {word:?} into {dst:?}: {e}"));
     }
     builder

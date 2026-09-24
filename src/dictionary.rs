@@ -48,6 +48,12 @@ mod tests {
     }
 
     #[test]
+    fn yo_can_be_typed_as_ye() {
+        assert!(contains(Lang::Ru, "ёлка"));
+        assert!(contains(Lang::Ru, "елка"));
+    }
+
+    #[test]
     fn unknown_words() {
         assert!(!contains(Lang::En, "ghbdtn"));
         assert!(!contains(Lang::Ru, "руддщ"));

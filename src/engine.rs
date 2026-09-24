@@ -14,14 +14,47 @@ struct TypedKey {
     capslock: bool,
 }
 
+/// One bit per physical modifier key, so releasing one side of a pair
+/// (e.g. right Ctrl) doesn't clear the other side while it's still held.
+const LEFT_SHIFT: u8 = 1 << 0;
+const RIGHT_SHIFT: u8 = 1 << 1;
+const LEFT_CTRL: u8 = 1 << 2;
+const RIGHT_CTRL: u8 = 1 << 3;
+const LEFT_ALT: u8 = 1 << 4;
+const RIGHT_ALT: u8 = 1 << 5;
+const LEFT_META: u8 = 1 << 6;
+const RIGHT_META: u8 = 1 << 7;
+
+const SHIFT: u8 = LEFT_SHIFT | RIGHT_SHIFT;
+/// Modifiers that turn a keypress into a shortcut rather than text.
+const SHORTCUT: u8 = LEFT_CTRL | RIGHT_CTRL | LEFT_ALT | RIGHT_ALT | LEFT_META | RIGHT_META;
+
+fn modifier_bit(code: KeyCode) -> Option<u8> {
+    Some(match code {
+        KeyCode::KEY_LEFTSHIFT => LEFT_SHIFT,
+        KeyCode::KEY_RIGHTSHIFT => RIGHT_SHIFT,
+        KeyCode::KEY_LEFTCTRL => LEFT_CTRL,
+        KeyCode::KEY_RIGHTCTRL => RIGHT_CTRL,
+        KeyCode::KEY_LEFTALT => LEFT_ALT,
+        KeyCode::KEY_RIGHTALT => RIGHT_ALT,
+        KeyCode::KEY_LEFTMETA => LEFT_META,
+        KeyCode::KEY_RIGHTMETA => RIGHT_META,
+        _ => return None,
+    })
+}
+
+/// Longest run of word keys still treated as a word. Anything longer is
+/// not a real word (or is text we can't safely retype), so the buffer
+/// stops growing and no correction is attempted until the next boundary.
+const MAX_WORD_KEYS: usize = 64;
+
 pub struct Engine {
     cfg: Config,
     buffer: Vec<TypedKey>,
-    shift_l: bool,
-    shift_r: bool,
-    ctrl: bool,
-    alt: bool,
-    meta: bool,
+    /// Set once the current word runs past `MAX_WORD_KEYS`.
+    overflowed: bool,
+    /// Currently held modifier keys, as `LEFT_SHIFT | ...` bits.
+    modifiers: u8,
     capslock: bool,
     current_class: String,
     /// Cached `excluded_classes` check for `current_class`, refreshed only
@@ -29,10 +62,14 @@ pub struct Engine {
     excluded: bool,
     /// Hyprland keyboard device name -> last known active language.
     device_lang: HashMap<String, Lang>,
+    /// The most recently observed active language on any keyboard, used
+    /// when the typing keyboard's own layout isn't known.
+    last_lang: Option<Lang>,
     keyboards: Vec<hypr::KeyboardDevice>,
-    /// evdev device name -> resolved Hyprland device name. The keyboard list
-    /// is fixed after startup, so each name only has to be resolved once.
-    resolved_devices: HashMap<String, Option<String>>,
+    /// evdev device name -> matched Hyprland device name. The fallback to
+    /// the main keyboard is never cached, and the cache is dropped whenever
+    /// the keyboard list is refreshed.
+    resolved_devices: HashMap<String, String>,
 }
 
 impl Engine {
@@ -49,41 +86,58 @@ impl Engine {
             }
         }
 
-        let keyboards = hypr::get_keyboards().unwrap_or_else(|e| {
-            tracing::warn!("could not query hyprctl devices at startup: {e:#}");
-            Vec::new()
-        });
-        let mut device_lang = HashMap::new();
-        for kb in &keyboards {
-            if let Some(lang) = detect_lang(&kb.active_keymap, &cfg) {
-                device_lang.insert(kb.name.clone(), lang);
-            }
-        }
         let current_class = hypr::get_active_window_class()
             .ok()
             .flatten()
             .unwrap_or_default();
         let excluded = is_excluded(&current_class, &cfg);
 
-        Self {
+        let mut engine = Self {
             cfg,
             buffer: Vec::new(),
-            shift_l: false,
-            shift_r: false,
-            ctrl: false,
-            alt: false,
-            meta: false,
+            overflowed: false,
+            modifiers: 0,
             capslock: false,
             current_class,
             excluded,
-            device_lang,
-            keyboards,
+            device_lang: HashMap::new(),
+            last_lang: None,
+            keyboards: Vec::new(),
             resolved_devices: HashMap::new(),
+        };
+        engine.refresh_keyboards();
+        engine
+    }
+
+    /// Re-reads Hyprland's keyboard list, e.g. after a keyboard is plugged
+    /// in. Layouts already learned from events are kept.
+    pub fn refresh_keyboards(&mut self) {
+        match hypr::get_keyboards() {
+            Ok(keyboards) => {
+                for kb in &keyboards {
+                    if !self.device_lang.contains_key(&kb.name)
+                        && let Some(lang) = detect_lang(&kb.active_keymap, &self.cfg)
+                    {
+                        self.device_lang.insert(kb.name.clone(), lang);
+                        if kb.main || self.last_lang.is_none() {
+                            self.last_lang = Some(lang);
+                        }
+                    }
+                }
+                self.keyboards = keyboards;
+                self.resolved_devices.clear();
+            }
+            Err(e) => tracing::warn!("could not query hyprctl devices: {e:#}"),
         }
     }
 
+    fn reset_word(&mut self) {
+        self.buffer.clear();
+        self.overflowed = false;
+    }
+
     fn shift(&self) -> bool {
-        self.shift_l || self.shift_r
+        self.modifiers & SHIFT != 0
     }
 
     pub fn handle_hypr(&mut self, ev: hypr::HyprEvent) {
@@ -92,60 +146,51 @@ impl Engine {
                 if class != self.current_class {
                     self.excluded = is_excluded(&class, &self.cfg);
                     self.current_class = class;
-                    self.buffer.clear();
+                    self.reset_word();
                 }
             }
             hypr::HyprEvent::ActiveLayout { keyboard, layout } => {
+                if !self.keyboards.iter().any(|kb| kb.name == keyboard) {
+                    // A keyboard we haven't seen yet, e.g. just plugged in.
+                    self.refresh_keyboards();
+                }
                 if let Some(lang) = detect_lang(&layout, &self.cfg) {
                     tracing::debug!(keyboard = %keyboard, layout = %layout, ?lang, "layout changed");
                     self.device_lang.insert(keyboard, lang);
+                    self.last_lang = Some(lang);
                 }
             }
         }
     }
 
     /// `value`: 0 = key up, 1 = key down, 2 = autorepeat.
+    ///
+    /// Autorepeat is handled like a key-down: a held letter or Backspace
+    /// keeps typing or deleting on screen, so the buffer has to follow it.
     pub fn handle_key(&mut self, source_device: &str, code: KeyCode, value: i32) {
-        if value == 2 {
-            return; // autorepeat doesn't add new characters we care about
+        let held = value != 0;
+
+        if let Some(bit) = modifier_bit(code) {
+            if held {
+                self.modifiers |= bit;
+            } else {
+                self.modifiers &= !bit;
+            }
+            return;
+        }
+        if code == KeyCode::KEY_CAPSLOCK {
+            if value == 1 {
+                self.capslock = !self.capslock;
+            }
+            return;
         }
 
-        match code {
-            KeyCode::KEY_LEFTSHIFT => {
-                self.shift_l = value == 1;
-                return;
-            }
-            KeyCode::KEY_RIGHTSHIFT => {
-                self.shift_r = value == 1;
-                return;
-            }
-            KeyCode::KEY_LEFTCTRL | KeyCode::KEY_RIGHTCTRL => {
-                self.ctrl = value == 1;
-                return;
-            }
-            KeyCode::KEY_LEFTALT | KeyCode::KEY_RIGHTALT => {
-                self.alt = value == 1;
-                return;
-            }
-            KeyCode::KEY_LEFTMETA | KeyCode::KEY_RIGHTMETA => {
-                self.meta = value == 1;
-                return;
-            }
-            KeyCode::KEY_CAPSLOCK => {
-                if value == 1 {
-                    self.capslock = !self.capslock;
-                }
-                return;
-            }
-            _ => {}
-        }
-
-        if value != 1 {
-            return; // everything below only reacts to key-down
+        if !held {
+            return; // everything below only reacts to key-down and autorepeat
         }
 
         if !self.cfg.general.enabled || self.excluded {
-            self.buffer.clear();
+            self.reset_word();
             return;
         }
 
@@ -154,14 +199,22 @@ impl Engine {
             return;
         }
 
-        if self.ctrl || self.alt || self.meta {
+        if self.modifiers & SHORTCUT != 0 {
             // A shortcut (Ctrl+C, Alt+Tab, Super+...), not text. Whatever
             // was buffered before it is no longer contiguous on screen.
-            self.buffer.clear();
+            self.reset_word();
             return;
         }
 
         if keymap::is_word_key(code) {
+            if self.overflowed {
+                return;
+            }
+            if self.buffer.len() >= MAX_WORD_KEYS {
+                self.buffer.clear();
+                self.overflowed = true;
+                return;
+            }
             self.buffer.push(TypedKey {
                 code,
                 shift: self.shift(),
@@ -171,15 +224,24 @@ impl Engine {
         }
 
         // Space, enter, tab, digits, punctuation, arrows, etc. all end the
-        // current word.
-        self.finalize(source_device);
+        // current word, but only a space is checked for a correction. By the
+        // time we see the key the application has already acted on it, so
+        // fixing the word means deleting and retyping that key too. That is
+        // safe for a space; Enter may already have sent a message, Tab moved
+        // focus and arrows moved the cursor away from the word.
+        if code == KeyCode::KEY_SPACE {
+            self.finalize(source_device, " ");
+        }
+        self.reset_word();
     }
 
-    fn finalize(&mut self, source_device: &str) {
-        let keys = std::mem::take(&mut self.buffer);
-        if keys.len() < self.cfg.general.min_word_length {
+    /// `boundary` is the text the word-ending key has already put on screen
+    /// after the word; it is deleted and retyped along with the correction.
+    fn finalize(&mut self, source_device: &str, boundary: &str) {
+        if self.overflowed {
             return;
         }
+        let keys = std::mem::take(&mut self.buffer);
 
         let device_name = self.resolve_hypr_device_name(source_device);
         let Some(current_lang) = self.lang_for_device(device_name.as_deref()) else {
@@ -187,36 +249,14 @@ impl Engine {
             return;
         };
 
-        let en_word: String = keys
-            .iter()
-            .filter_map(|k| keymap::char_for(k.code, k.shift, k.capslock, Lang::En))
-            .collect();
-        let ru_word: String = keys
-            .iter()
-            .filter_map(|k| keymap::char_for(k.code, k.shift, k.capslock, Lang::Ru))
-            .collect();
-
-        let (typed_word, other_word, other_lang) = match current_lang {
-            Lang::En => (&en_word, &ru_word, Lang::Ru),
-            Lang::Ru => (&ru_word, &en_word, Lang::En),
+        let other_lang = current_lang.other();
+        let Some(corrected) = correction(&keys, current_lang, self.cfg.general.min_word_length)
+        else {
+            return;
         };
 
-        // Already a real word in the layout that's actually active: nothing
-        // to do.
-        if dictionary::contains(current_lang, typed_word) {
-            return;
-        }
-        // Only correct when the *other* interpretation is a real word - an
-        // unrecognized word in both dictionaries is far more likely to be a
-        // name, a command, or a typo than a layout mistake.
-        if !dictionary::contains(other_lang, other_word) {
-            return;
-        }
-
-        let corrected = apply_case_pattern(typed_word, other_word);
-        tracing::info!(from = %typed_word, to = %corrected, "autocorrecting keyboard layout");
-
-        if let Err(e) = typer::correct_word(keys.len(), &corrected) {
+        let backspaces = keys.len() + boundary.chars().count();
+        if let Err(e) = typer::correct_word(backspaces, &format!("{corrected}{boundary}")) {
             tracing::warn!("failed to retype corrected word: {e:#}");
             return;
         }
@@ -230,6 +270,7 @@ impl Engine {
                 match hypr::switch_layout(&device_name, index) {
                     Ok(()) => {
                         self.device_lang.insert(device_name, other_lang);
+                        self.last_lang = Some(other_lang);
                     }
                     Err(e) => tracing::warn!("failed to switch layout: {e:#}"),
                 }
@@ -249,7 +290,7 @@ impl Engine {
         }
         // Fall back to whatever layout we've most recently observed on any
         // keyboard - better than nothing on unusual multi-keyboard setups.
-        self.device_lang.values().next().copied()
+        self.last_lang
     }
 
     /// Hyprland slugifies libinput device names (lowercase, spaces -> `-`)
@@ -260,29 +301,76 @@ impl Engine {
             return Some(o.clone());
         }
         if let Some(cached) = self.resolved_devices.get(evdev_name) {
-            return cached.clone();
+            return Some(cached.clone());
         }
-        let resolved = self.match_hypr_device_name(evdev_name);
-        self.resolved_devices
-            .insert(evdev_name.to_string(), resolved.clone());
-        resolved
-    }
-
-    fn match_hypr_device_name(&self, evdev_name: &str) -> Option<String> {
         let slug = evdev_name.to_lowercase().replace(' ', "-");
         if let Some(kb) = self
             .keyboards
             .iter()
             .find(|kb| kb.name == slug || kb.name.contains(&slug) || slug.contains(&kb.name))
         {
+            self.resolved_devices
+                .insert(evdev_name.to_string(), kb.name.clone());
             return Some(kb.name.clone());
         }
+        // Not cached: the keyboard may just not be in Hyprland's list yet, and
+        // a later refresh should get a chance to match it properly.
         self.keyboards
             .iter()
             .find(|k| k.main)
             .or_else(|| self.keyboards.first())
             .map(|k| k.name.clone())
     }
+}
+
+/// The text `keys` should be replaced with if they were typed in the wrong
+/// layout (`current_lang` being the active one), or `None` to leave them.
+fn correction(keys: &[TypedKey], current_lang: Lang, min_word_length: usize) -> Option<String> {
+    let en_word: String = keys
+        .iter()
+        .filter_map(|k| keymap::char_for(k.code, k.shift, k.capslock, Lang::En))
+        .collect();
+    let ru_word: String = keys
+        .iter()
+        .filter_map(|k| keymap::char_for(k.code, k.shift, k.capslock, Lang::Ru))
+        .collect();
+
+    let other_lang = current_lang.other();
+    let (typed_word, other_word) = match current_lang {
+        Lang::En => (&en_word, &ru_word),
+        Lang::Ru => (&ru_word, &en_word),
+    };
+
+    // Punctuation typed right after a word (e.g. the key that is `.` in
+    // Russian but `/` in English) isn't part of the word, so look up each
+    // interpretation without it. It is still retyped as part of the
+    // corrected text below.
+    let typed_core = trim_trailing_punctuation(typed_word);
+    let other_core = trim_trailing_punctuation(other_word);
+    if other_core.chars().count() < min_word_length {
+        return None;
+    }
+
+    // Already a real word in the layout that's actually active: nothing
+    // to do.
+    if dictionary::contains(current_lang, typed_core) {
+        return None;
+    }
+    // Only correct when the *other* interpretation is a real word - an
+    // unrecognized word in both dictionaries is far more likely to be a
+    // name, a command, or a typo than a layout mistake.
+    if !dictionary::contains(other_lang, other_core) {
+        return None;
+    }
+
+    let corrected = apply_case_pattern(typed_word, other_word);
+    tracing::info!(from = %typed_word, to = %corrected, "autocorrecting keyboard layout");
+    Some(corrected)
+}
+
+/// `word` without any non-letters at its end.
+fn trim_trailing_punctuation(word: &str) -> &str {
+    word.trim_end_matches(|c: char| !c.is_alphabetic())
 }
 
 /// `cfg.general.excluded_classes` must already be lowercased (see
@@ -341,6 +429,151 @@ fn apply_case_pattern(source: &str, target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DOWN: i32 = 1;
+    const REPEAT: i32 = 2;
+
+    fn keys(codes: &[KeyCode]) -> Vec<TypedKey> {
+        codes
+            .iter()
+            .map(|&code| TypedKey {
+                code,
+                shift: false,
+                capslock: false,
+            })
+            .collect()
+    }
+
+    // g h b d t n = "привет" on the Russian layout.
+    const PRIVET: [KeyCode; 6] = [
+        KeyCode::KEY_G,
+        KeyCode::KEY_H,
+        KeyCode::KEY_B,
+        KeyCode::KEY_D,
+        KeyCode::KEY_T,
+        KeyCode::KEY_N,
+    ];
+
+    #[test]
+    fn corrects_word_typed_in_wrong_layout() {
+        assert_eq!(
+            correction(&keys(&PRIVET), Lang::En, 3).as_deref(),
+            Some("привет")
+        );
+    }
+
+    #[test]
+    fn corrects_word_with_trailing_punctuation() {
+        // The `/` key is `.` on the Russian layout.
+        let mut codes = PRIVET.to_vec();
+        codes.push(KeyCode::KEY_SLASH);
+        assert_eq!(
+            correction(&keys(&codes), Lang::En, 3).as_deref(),
+            Some("привет.")
+        );
+    }
+
+    #[test]
+    fn leaves_real_word_with_trailing_punctuation() {
+        // "hello," in the English layout is fine as typed.
+        let codes = [
+            KeyCode::KEY_H,
+            KeyCode::KEY_E,
+            KeyCode::KEY_L,
+            KeyCode::KEY_L,
+            KeyCode::KEY_O,
+            KeyCode::KEY_COMMA,
+        ];
+        assert_eq!(correction(&keys(&codes), Lang::En, 3), None);
+    }
+
+    #[test]
+    fn word_over_the_limit_is_not_corrected() {
+        let mut engine = Engine::new(Config::default());
+        engine.last_lang = Some(Lang::En);
+        for _ in 0..MAX_WORD_KEYS + 1 {
+            engine.handle_key("kbd", KeyCode::KEY_G, DOWN);
+        }
+        assert!(engine.overflowed);
+        assert!(engine.buffer.len() <= MAX_WORD_KEYS);
+        engine.handle_key("kbd", KeyCode::KEY_SPACE, DOWN);
+        assert!(!engine.overflowed);
+        assert!(engine.buffer.is_empty());
+    }
+
+    #[test]
+    fn unknown_keyboard_uses_most_recent_layout() {
+        let mut engine = Engine::new(Config::default());
+        for (keyboard, layout) in [
+            ("a", "English (US)"),
+            ("b", "Russian"),
+            ("a", "English (US)"),
+        ] {
+            engine.handle_hypr(hypr::HyprEvent::ActiveLayout {
+                keyboard: keyboard.to_string(),
+                layout: layout.to_string(),
+            });
+        }
+        assert_eq!(engine.lang_for_device(Some("c")), Some(Lang::En));
+        assert_eq!(engine.lang_for_device(Some("b")), Some(Lang::Ru));
+    }
+
+    #[test]
+    fn autorepeat_letter_extends_word() {
+        let mut engine = Engine::new(Config::default());
+        engine.handle_key("kbd", KeyCode::KEY_G, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_G, REPEAT);
+        engine.handle_key("kbd", KeyCode::KEY_G, REPEAT);
+        assert_eq!(engine.buffer.len(), 3);
+    }
+
+    #[test]
+    fn autorepeat_backspace_keeps_deleting() {
+        let mut engine = Engine::new(Config::default());
+        for code in [
+            KeyCode::KEY_G,
+            KeyCode::KEY_H,
+            KeyCode::KEY_B,
+            KeyCode::KEY_D,
+        ] {
+            engine.handle_key("kbd", code, DOWN);
+        }
+        engine.handle_key("kbd", KeyCode::KEY_BACKSPACE, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_BACKSPACE, REPEAT);
+        engine.handle_key("kbd", KeyCode::KEY_BACKSPACE, REPEAT);
+        assert_eq!(engine.buffer.len(), 1);
+    }
+
+    #[test]
+    fn releasing_one_ctrl_keeps_the_other_held() {
+        let mut engine = Engine::new(Config::default());
+        engine.handle_key("kbd", KeyCode::KEY_G, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_LEFTCTRL, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTCTRL, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTCTRL, 0);
+        // Left Ctrl is still down, so this is Ctrl+H, not the letter h.
+        engine.handle_key("kbd", KeyCode::KEY_H, DOWN);
+        assert!(engine.buffer.is_empty());
+    }
+
+    #[test]
+    fn releasing_one_shift_keeps_the_other_held() {
+        let mut engine = Engine::new(Config::default());
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, 0);
+        assert!(engine.shift());
+    }
+
+    #[test]
+    fn autorepeat_modifier_stays_held() {
+        let mut engine = Engine::new(Config::default());
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, REPEAT);
+        assert!(engine.shift());
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, 0);
+        assert!(!engine.shift());
+    }
 
     #[test]
     fn case_pattern_all_caps() {

@@ -16,6 +16,15 @@ pub enum Lang {
     Ru,
 }
 
+impl Lang {
+    pub fn other(self) -> Lang {
+        match self {
+            Lang::En => Lang::Ru,
+            Lang::Ru => Lang::En,
+        }
+    }
+}
+
 /// (en_lower, en_upper, ru_lower, ru_upper) for every physical key that can
 /// produce a letter in *either* language. Note several keys that are pure
 /// punctuation on a US layout (`[`, `]`, `;`, `'`, `,`, `.`, `` ` ``) double
