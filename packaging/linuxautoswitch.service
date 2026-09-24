@@ -1,0 +1,14 @@
+[Unit]
+Description=linuxautoswitch - automatic EN/RU keyboard layout correction
+Documentation=https://github.com/mitialab/linuxautoswitch
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/linuxautoswitch
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=graphical-session.target
