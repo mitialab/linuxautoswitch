@@ -69,3 +69,23 @@ russian_index = 1
 # if auto-detection picks the wrong one. Find the right value with:
 #   hyprctl devices | grep -A2 Keyboard
 # device_name_override = "at-translated-set-2-keyboard"
+
+[hotkeys]
+enabled = true
+
+# Key to double-tap to manually flip the last word to the other language,
+# bypassing the dictionary check entirely - for names, jargon, or anything
+# the automatic detection didn't recognize. Works on the word still being
+# typed, or (if you've already moved on) the last completed one - press
+# again to flip back. One of: leftshift, rightshift, leftctrl, rightctrl,
+# leftalt, rightalt, leftmeta/leftsuper, rightmeta/rightsuper.
+manual_correct_key = "leftshift"
+
+# Maximum gap between the two taps, in milliseconds.
+manual_correct_window_ms = 400
+
+# Keys that, held down together, toggle the whole daemon paused/running -
+# same key names as manual_correct_key above. This always works, even while
+# already paused or on an excluded window - it's the way out. Same effect
+# as `linuxautoswitch toggle` from a shell.
+toggle_pause_keys = ["leftshift", "rightshift"]

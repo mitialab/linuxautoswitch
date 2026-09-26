@@ -2,6 +2,16 @@
 
 **Language:** English | [Русский](README.ru.md)
 
+> **🤖 This project is vibecoded.** Essentially all of the code, the design
+> decisions, the tests, and this README were written by
+> [Claude](https://claude.ai) (Anthropic's AI, via Claude Code) from
+> natural-language prompts - not typed by hand. The repository owner
+> directed it at a high level and reviewed the results, but did not author
+> the implementation line by line. This daemon reads every raw keystroke
+> from your keyboard and injects synthetic key events back into your
+> session - please actually read the code yourself (it's not that long)
+> before you trust it with that, rather than taking a README's word for it.
+
 Automatic EN/RU keyboard layout correction for [Omarchy](https://omarchy.org)
 (Hyprland). Inspired by [Caramba Switcher](https://caramba.io) and the
 classic Windows tool Punto Switcher: type a word in the wrong layout -
@@ -38,6 +48,12 @@ word is retyped.
    `switchxkblayout`, and retype the corrected word - via Wayland's virtual
    keyboard protocol (`wtype`), so it never sees its own corrections as new
    input.
+4. Automatic detection only fires when it can find the word in one
+   dictionary but not the other - names, jargon, and anything not in either
+   dictionary go untouched. For those, a manual hotkey (default:
+   double-tap Left Shift) flips the current or last word to the other
+   language regardless of dictionary validity, the same way Caramba's own
+   manual-fix shortcut does. See [Manual correction & pausing](#manual-correction--pausing).
 
 Dictionary lookups run against ~370k English and ~1.5M Russian word forms
 (plus a curated list of common site/brand/tech names like "google" or
@@ -139,6 +155,54 @@ Key settings:
 - `hypr.device_name_override` - force a specific keyboard device on
   multi-keyboard setups (`hyprctl devices | grep -A2 Keyboard`)
 
+## Manual correction & pausing
+
+Automatic detection needs a word to be recognizable in one dictionary but
+not the other - it won't touch a name, a piece of jargon, or anything that
+just isn't in either dictionary. Two hotkeys, both reconfigurable in
+`[hotkeys]` in the config, cover what automatic detection can't:
+
+- **Double-tap Left Shift** (`hotkeys.manual_correct_key`,
+  `hotkeys.manual_correct_window_ms`) - flips the word under the cursor to
+  the other language, no dictionary check at all. Works on the word you're
+  still typing, or (if you've already moved on) the last completed one;
+  press it again to flip back, same as Caramba's own manual-fix shortcut.
+- **Left Shift + Right Shift together** (`hotkeys.toggle_pause_keys`) -
+  pauses or resumes the whole daemon. Always works, even while already
+  paused or focused on an excluded window, since it's the way out of both.
+
+Set `hotkeys.enabled = false` to turn off both, or change either key
+combination to any of: `leftshift`, `rightshift`, `leftctrl`, `rightctrl`,
+`leftalt`, `rightalt`, `leftmeta`/`leftsuper`, `rightmeta`/`rightsuper`.
+
+## Checking status from your shell
+
+The running daemon exposes its state over a small control socket, and the
+same binary talks to it as a client when run with a subcommand:
+
+```sh
+linuxautoswitch status          # "linuxautoswitch: running - layout EN"
+linuxautoswitch status --json   # {"paused":false,"lang":"en","excluded":false}
+linuxautoswitch pause           # pause (same effect as the pause hotkey)
+linuxautoswitch resume
+linuxautoswitch toggle
+```
+
+For a status-bar indicator (Omarchy's default bar is
+[Waybar](https://github.com/Alexays/Waybar)) showing the current layout as
+text - "EN"/"RU", or "⏸ EN" while paused - add a custom module:
+
+```jsonc
+// ~/.config/waybar/config
+"custom/linuxautoswitch": {
+  "exec": "linuxautoswitch waybar",
+  "interval": 2,
+  "return-type": "json"
+}
+```
+
+and reference `"custom/linuxautoswitch"` in one of the bar's module lists.
+
 ## Known limitations
 
 - Only two layouts (English/Russian) are supported for now.
@@ -159,6 +223,14 @@ Key settings:
   dictionary. Raise `eager_min_word_length`, or turn `eager_correction` off
   to fall back to boundary-only correction, if this happens often enough to
   bother you.
+- The manual-flip hotkey has the same "acting after the fact" caveat as
+  automatic correction: if you've already pressed Enter and moved on (a
+  message sent, a new empty line focused), flipping the "last word"
+  retypes it wherever the cursor happens to be now, not where it actually
+  is on screen.
+- Only one daemon instance can hold the control socket (used by
+  `status`/`pause`/`resume`/`toggle`/`waybar`) at a time; a second instance
+  still runs, but logs a warning and skips starting its own socket.
 
 ## Uninstall
 
@@ -170,8 +242,11 @@ systemctl --user daemon-reload
 
 ## Credits
 
-This project wouldn't work without:
+This project wouldn't work, or exist, without:
 
+- **[Claude](https://claude.ai) / Claude Code (Anthropic)** - wrote the code,
+  the tests, and this documentation. See the disclosure at the top of this
+  file.
 - **Concept**: [Caramba Switcher](https://caramba.io) (macOS/Windows) and
   the original Punto Switcher, whose "type it wrong, get it fixed
   automatically" approach this project ports to Linux/Hyprland.
@@ -189,3 +264,10 @@ This project wouldn't work without:
   keyboard input, [`fst`](https://crates.io/crates/fst) (BurntSushi) for the
   compact embedded dictionaries, plus `clap`, `serde`, `toml`, `tracing`,
   and `anyhow`.
+
+## License
+
+linuxautoswitch's own code is [MIT-licensed](LICENSE). The two embedded
+dictionaries and `wtype` carry their own licenses (also MIT, plus the
+Unlicense for the English word list) - see
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for the full texts.
