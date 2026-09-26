@@ -2,19 +2,23 @@
 //! freedesktop/KDE StatusNotifierItem D-Bus protocol - the same mechanism
 //! any other tray application (a network applet, a chat client) uses. It
 //! shows up in Waybar's own `tray` module, KDE Plasma natively, GNOME with
-//! an AppIndicator extension, or any other SNI host - independent of the
-//! `linuxautoswitch waybar` subcommand, which is a plain text status-bar
-//! module for people who'd rather not run a tray host at all.
+//! an AppIndicator extension, or Quickshell (Omarchy's own shell) - any SNI
+//! host - independent of the `linuxautoswitch waybar` subcommand, which is
+//! a plain text status-bar module for people who'd rather not run a tray
+//! host at all.
 //!
-//! The icon itself is drawn at runtime as a small ARGB bitmap (a solid
-//! background colored by state, plus "EN"/"RU" text or a pause symbol in a
-//! hand-rolled 5x7 pixel font) rather than shipped as image files - no
-//! icon-theme installation step, no extra asset files to keep in sync.
+//! The icon itself is drawn at runtime as a small ARGB circle (a single
+//! letter - "E"/"Р" - in a hand-rolled 5x7 pixel font, on a solid disc)
+//! rather than shipped as image files - no icon-theme installation step, no
+//! extra asset files to keep in sync. Colors come from Omarchy's active
+//! theme when running under it (see `load_theme_colors` below), falling
+//! back to a plain grey scheme otherwise.
 
 use crate::keymap::Lang;
 use ksni::Icon;
 use ksni::blocking::TrayMethods;
 use ksni::menu::StandardItem;
+use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -162,39 +166,145 @@ const SCALE: i32 = 4;
 const FONT_WIDTH: usize = 5;
 const FONT_HEIGHT: usize = 7;
 
-/// 5x7 dot-matrix glyphs, MSB-first per row (bit 4 = leftmost column). Only
-/// the letters actually needed ("EN"/"RU") plus a fallback dash for an
-/// unknown layout.
+type Rgb = (u8, u8, u8);
+
+/// The subset of Omarchy's theme palette (see `load_theme_colors`) this icon
+/// needs. Field names and fallback values match Omarchy's own Quickshell
+/// shell (`shell/Commons/Color.qml`) exactly, so an unthemed icon looks like
+/// an unthemed *shell* - a plain grey scheme - rather than an arbitrary
+/// palette of our own invention.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct ThemeColors {
+    background: Rgb,
+    foreground: Rgb,
+    accent: Rgb,
+    muted: Rgb,
+}
+
+impl Default for ThemeColors {
+    fn default() -> Self {
+        Self {
+            background: (0x10, 0x13, 0x15),
+            foreground: (0xca, 0xcc, 0xcc),
+            accent: (0xca, 0xcc, 0xcc),
+            muted: (0x70, 0x78, 0x80),
+        }
+    }
+}
+
+fn theme_colors_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".local/state/omarchy/current/theme/colors.toml"))
+}
+
+/// Reads Omarchy's active theme colors from the same file its own shell
+/// does (`~/.local/state/omarchy/current/theme/colors.toml`, generated per
+/// theme by `omarchy-theme-colors-from-alacritty`: flat `key = "#rrggbb"`
+/// lines), so the tray icon matches the desktop instead of a palette we
+/// made up. Falls back to `ThemeColors::default()` - the same grey scheme
+/// Omarchy's shell itself falls back to - when the file is missing or a
+/// field isn't present (not running under Omarchy, or no theme set yet).
+fn load_theme_colors() -> ThemeColors {
+    let mut colors = ThemeColors::default();
+    let Some(path) = theme_colors_path() else {
+        return colors;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return colors;
+    };
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let Some(rgb) = parse_hex_color(value) else {
+            continue;
+        };
+        match key.trim() {
+            "background" => colors.background = rgb,
+            "foreground" => colors.foreground = rgb,
+            "accent" => colors.accent = rgb,
+            "muted" => colors.muted = rgb,
+            _ => {}
+        }
+    }
+    colors
+}
+
+/// Parses `"#rrggbb"` (quotes optional) into RGB components.
+fn parse_hex_color(s: &str) -> Option<Rgb> {
+    let s = s.trim().trim_matches(['"', '\'']);
+    let s = s.strip_prefix('#')?;
+    if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some((r, g, b))
+}
+
+/// Picks black or white text for readability over `bg`, using perceived
+/// luminance (ITU-R BT.601) rather than assuming any particular theme
+/// accent is light or dark - they vary a lot from theme to theme.
+fn contrasting_text(bg: Rgb) -> Rgb {
+    let (r, g, b) = bg;
+    let luminance = 0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64;
+    if luminance > 150.0 {
+        (0x1a, 0x1a, 0x1a)
+    } else {
+        (0xff, 0xff, 0xff)
+    }
+}
+
+/// 5x7 dot-matrix glyphs, MSB-first per row (bit 4 = leftmost column).
+/// 'P' doubles as Cyrillic 'Р' (er), which has the same shape as Latin
+/// P - used for the Russian layout indicator - so there's no need for a
+/// separate non-ASCII glyph.
 fn glyph_rows(c: char) -> [u8; FONT_HEIGHT] {
     match c {
         'E' => [
             0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
         ],
-        'N' => [
-            0b10001, 0b11001, 0b10101, 0b10101, 0b10011, 0b10001, 0b10001,
+        'P' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
         ],
-        'R' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
-        ],
-        'U' => [
-            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
-        ],
-        _ => [0, 0, 0, 0b11111, 0, 0, 0], // dash, for an unknown/"--" layout
+        _ => [0, 0, 0, 0b11111, 0, 0, 0], // dash, for an unknown layout
     }
 }
 
-fn set_px(buf: &mut [u8], x: i32, y: i32) {
+fn set_px(buf: &mut [u8], x: i32, y: i32, color: Rgb) {
     if x < 0 || y < 0 || x >= ICON_SIZE || y >= ICON_SIZE {
         return;
     }
     let idx = ((y * ICON_SIZE + x) * 4) as usize;
+    // ARGB32, network (big-endian) byte order: A, R, G, B per pixel.
     buf[idx] = 255;
-    buf[idx + 1] = 255;
-    buf[idx + 2] = 255;
-    buf[idx + 3] = 255;
+    buf[idx + 1] = color.0;
+    buf[idx + 2] = color.1;
+    buf[idx + 3] = color.2;
 }
 
-fn draw_glyph(buf: &mut [u8], origin_x: i32, origin_y: i32, c: char) {
+/// Fills a disc of `radius` around the icon's center with `color`; pixels
+/// outside stay fully transparent, so the tray shows a round icon rather
+/// than a square one.
+fn draw_disc(buf: &mut [u8], radius: f64, color: Rgb) {
+    let center = ICON_SIZE as f64 / 2.0;
+    for y in 0..ICON_SIZE {
+        for x in 0..ICON_SIZE {
+            let dx = x as f64 + 0.5 - center;
+            let dy = y as f64 + 0.5 - center;
+            if dx * dx + dy * dy <= radius * radius {
+                set_px(buf, x, y, color);
+            }
+        }
+    }
+}
+
+fn draw_glyph_centered(buf: &mut [u8], c: char, color: Rgb) {
+    let glyph_w = FONT_WIDTH as i32 * SCALE;
+    let glyph_h = FONT_HEIGHT as i32 * SCALE;
+    let origin_x = (ICON_SIZE - glyph_w) / 2;
+    let origin_y = (ICON_SIZE - glyph_h) / 2;
     for (row, bits) in glyph_rows(c).iter().enumerate() {
         for col in 0..FONT_WIDTH {
             if bits & (1 << (FONT_WIDTH - 1 - col)) == 0 {
@@ -204,74 +314,48 @@ fn draw_glyph(buf: &mut [u8], origin_x: i32, origin_y: i32, c: char) {
             let py = origin_y + row as i32 * SCALE;
             for dy in 0..SCALE {
                 for dx in 0..SCALE {
-                    set_px(buf, px + dx, py + dy);
+                    set_px(buf, px + dx, py + dy, color);
                 }
             }
         }
     }
 }
 
-fn draw_text(buf: &mut [u8], text: &str) {
-    let glyph_w = FONT_WIDTH as i32 * SCALE;
-    let glyph_h = FONT_HEIGHT as i32 * SCALE;
-    let count = text.chars().count() as i32;
-    let total_w = glyph_w * count + SCALE * (count - 1).max(0);
-    let start_x = (ICON_SIZE - total_w) / 2;
-    let start_y = (ICON_SIZE - glyph_h) / 2;
-    for (i, c) in text.chars().enumerate() {
-        draw_glyph(buf, start_x + i as i32 * (glyph_w + SCALE), start_y, c);
-    }
-}
-
-fn draw_pause_bars(buf: &mut [u8]) {
-    let bar_w = 8;
+fn draw_pause_bars_centered(buf: &mut [u8], color: Rgb) {
+    let bar_w = 6;
     let bar_h = FONT_HEIGHT as i32 * SCALE;
-    let gap = 8;
+    let gap = 6;
     let start_x = (ICON_SIZE - (bar_w * 2 + gap)) / 2;
     let start_y = (ICON_SIZE - bar_h) / 2;
     for bar in 0..2 {
         let x0 = start_x + bar * (bar_w + gap);
         for x in x0..x0 + bar_w {
             for y in start_y..start_y + bar_h {
-                set_px(buf, x, y);
+                set_px(buf, x, y, color);
             }
         }
     }
 }
 
-/// Renders the tray icon: a background colored by state (gray when paused,
-/// otherwise blue for English / green for Russian / dark gray if the
-/// layout isn't known yet) with either "EN"/"RU" text or a pause symbol
-/// drawn in white on top.
-fn render_icon(paused: bool, lang: Option<Lang>) -> Icon {
-    let (r, g, b) = if paused {
-        (0x88, 0x88, 0x88)
-    } else {
-        match lang {
-            Some(Lang::En) => (0x2b, 0x6c, 0xb0),
-            Some(Lang::Ru) => (0x2f, 0x85, 0x5a),
-            None => (0x55, 0x55, 0x55),
-        }
-    };
+/// Renders the tray icon: a disc filled with `theme.accent` (or
+/// `theme.muted` while paused) with either a single "E"/"P" letter or a
+/// pause symbol in a contrasting color on top.
+fn render_icon_with_theme(paused: bool, lang: Option<Lang>, theme: ThemeColors) -> Icon {
+    let fill = if paused { theme.muted } else { theme.accent };
+    let text_color = contrasting_text(fill);
 
     let mut data = vec![0u8; (ICON_SIZE * ICON_SIZE * 4) as usize];
-    for px in data.chunks_exact_mut(4) {
-        // ARGB32, network (big-endian) byte order: A, R, G, B per pixel.
-        px[0] = 255;
-        px[1] = r;
-        px[2] = g;
-        px[3] = b;
-    }
+    draw_disc(&mut data, ICON_SIZE as f64 / 2.0 - 1.0, fill);
 
     if paused {
-        draw_pause_bars(&mut data);
+        draw_pause_bars_centered(&mut data, text_color);
     } else {
-        let text = match lang {
-            Some(Lang::En) => "EN",
-            Some(Lang::Ru) => "RU",
-            None => "--",
+        let letter = match lang {
+            Some(Lang::En) => 'E',
+            Some(Lang::Ru) => 'P', // Cyrillic Р
+            None => '-',
         };
-        draw_text(&mut data, text);
+        draw_glyph_centered(&mut data, letter, text_color);
     }
 
     Icon {
@@ -279,6 +363,10 @@ fn render_icon(paused: bool, lang: Option<Lang>) -> Icon {
         height: ICON_SIZE,
         data,
     }
+}
+
+fn render_icon(paused: bool, lang: Option<Lang>) -> Icon {
+    render_icon_with_theme(paused, lang, load_theme_colors())
 }
 
 #[cfg(test)]
@@ -295,48 +383,96 @@ mod tests {
         ]
     }
 
+    const THEME: ThemeColors = ThemeColors {
+        background: (0x10, 0x13, 0x15),
+        foreground: (0xca, 0xcc, 0xcc),
+        accent: (0x4a, 0x9e, 0xff), // an arbitrary blue, distinct from grey
+        muted: (0x70, 0x78, 0x80),
+    };
+
     #[test]
     fn icon_has_expected_dimensions() {
-        let icon = render_icon(false, Some(Lang::En));
+        let icon = render_icon_with_theme(false, Some(Lang::En), THEME);
         assert_eq!(icon.width, ICON_SIZE);
         assert_eq!(icon.height, ICON_SIZE);
         assert_eq!(icon.data.len(), (ICON_SIZE * ICON_SIZE * 4) as usize);
     }
 
     #[test]
-    fn running_uses_language_background_color() {
-        // Corner pixel is background, never touched by the centered text.
+    fn corner_pixels_are_transparent_outside_the_circle() {
+        let icon = render_icon_with_theme(false, Some(Lang::En), THEME);
+        assert_eq!(pixel(&icon, 0, 0)[0], 0, "corner alpha should be 0");
+    }
+
+    #[test]
+    fn center_uses_accent_color_while_running() {
+        let icon = render_icon_with_theme(false, None, THEME);
+        // Center of the disc, off to the side of the centered glyph, is
+        // still the plain fill color.
+        let center = ICON_SIZE / 2;
+        assert_eq!(pixel(&icon, 4, center)[0], 255, "should be inside the disc");
         assert_eq!(
-            pixel(&render_icon(false, Some(Lang::En)), 0, 0),
-            [255, 0x2b, 0x6c, 0xb0]
-        );
-        assert_eq!(
-            pixel(&render_icon(false, Some(Lang::Ru)), 0, 0),
-            [255, 0x2f, 0x85, 0x5a]
+            pixel(&icon, 4, center),
+            [255, THEME.accent.0, THEME.accent.1, THEME.accent.2]
         );
     }
 
     #[test]
-    fn paused_uses_gray_background_regardless_of_language() {
+    fn paused_uses_muted_color_regardless_of_language() {
+        let icon = render_icon_with_theme(true, Some(Lang::En), THEME);
+        let center = ICON_SIZE / 2;
         assert_eq!(
-            pixel(&render_icon(true, Some(Lang::En)), 0, 0),
-            [255, 0x88, 0x88, 0x88]
-        );
-        assert_eq!(
-            pixel(&render_icon(true, None), 0, 0),
-            [255, 0x88, 0x88, 0x88]
+            pixel(&icon, 4, center),
+            [255, THEME.muted.0, THEME.muted.1, THEME.muted.2]
         );
     }
 
     #[test]
-    fn running_draws_white_text_pixels() {
-        let icon = render_icon(false, Some(Lang::Ru));
-        assert!(icon.data.chunks_exact(4).any(|p| p == [255, 255, 255, 255]));
+    fn running_draws_a_contrasting_letter() {
+        let icon = render_icon_with_theme(false, Some(Lang::Ru), THEME);
+        let text = contrasting_text(THEME.accent);
+        assert!(
+            icon.data
+                .chunks_exact(4)
+                .any(|p| p == [255, text.0, text.1, text.2])
+        );
     }
 
     #[test]
-    fn paused_draws_white_bar_pixels() {
-        let icon = render_icon(true, None);
-        assert!(icon.data.chunks_exact(4).any(|p| p == [255, 255, 255, 255]));
+    fn paused_draws_contrasting_bars() {
+        let icon = render_icon_with_theme(true, None, THEME);
+        let text = contrasting_text(THEME.muted);
+        assert!(
+            icon.data
+                .chunks_exact(4)
+                .any(|p| p == [255, text.0, text.1, text.2])
+        );
+    }
+
+    #[test]
+    fn contrasting_text_picks_white_on_dark_black_on_light() {
+        assert_eq!(contrasting_text((0x10, 0x10, 0x10)), (0xff, 0xff, 0xff));
+        assert_eq!(contrasting_text((0xf0, 0xf0, 0xf0)), (0x1a, 0x1a, 0x1a));
+    }
+
+    #[test]
+    fn parses_quoted_and_unquoted_hex_colors() {
+        assert_eq!(parse_hex_color("\"#aabbcc\""), Some((0xaa, 0xbb, 0xcc)));
+        assert_eq!(parse_hex_color("#001122"), Some((0x00, 0x11, 0x22)));
+        assert_eq!(parse_hex_color("not-a-color"), None);
+        assert_eq!(parse_hex_color("#zzzzzz"), None);
+    }
+
+    #[test]
+    fn default_theme_matches_omarchy_shells_own_fallback() {
+        // Keep this in sync with shell/Commons/Color.qml's hardcoded
+        // fallback values in Omarchy's own Quickshell shell - the whole
+        // point of matching them is an unthemed icon looking like an
+        // unthemed *shell*, not an arbitrary palette of our own.
+        let theme = ThemeColors::default();
+        assert_eq!(theme.background, (0x10, 0x13, 0x15));
+        assert_eq!(theme.foreground, (0xca, 0xcc, 0xcc));
+        assert_eq!(theme.accent, (0xca, 0xcc, 0xcc));
+        assert_eq!(theme.muted, (0x70, 0x78, 0x80));
     }
 }
