@@ -141,6 +141,60 @@ pub fn char_for(key: KeyCode, shift: bool, capslock: bool, lang: Lang) -> Option
     })
 }
 
+/// Parses a hotkey key name (case-insensitive, e.g. `"leftshift"` or
+/// `"left-shift"`) from config into the modifier key it refers to. Only the
+/// eight true modifier keys are supported as hotkey triggers - they're the
+/// only keys this daemon already tracks the held/released state of
+/// independent of the word buffer, so using anything else (a letter, Caps
+/// Lock) would need different, more invasive plumbing.
+pub fn parse_modifier_key(name: &str) -> Option<KeyCode> {
+    Some(
+        match name.to_lowercase().replace(['_', '-', ' '], "").as_str() {
+            "leftshift" | "shiftleft" => KeyCode::KEY_LEFTSHIFT,
+            "rightshift" | "shiftright" => KeyCode::KEY_RIGHTSHIFT,
+            "leftctrl" | "ctrlleft" | "leftcontrol" => KeyCode::KEY_LEFTCTRL,
+            "rightctrl" | "ctrlright" | "rightcontrol" => KeyCode::KEY_RIGHTCTRL,
+            "leftalt" | "altleft" => KeyCode::KEY_LEFTALT,
+            "rightalt" | "altright" => KeyCode::KEY_RIGHTALT,
+            "leftmeta" | "leftsuper" | "metaleft" | "superleft" => KeyCode::KEY_LEFTMETA,
+            "rightmeta" | "rightsuper" | "metaright" | "superright" => KeyCode::KEY_RIGHTMETA,
+            _ => return None,
+        },
+    )
+}
+
+#[cfg(test)]
+mod hotkey_tests {
+    use super::*;
+
+    #[test]
+    fn parses_known_modifier_names() {
+        assert_eq!(
+            parse_modifier_key("leftshift"),
+            Some(KeyCode::KEY_LEFTSHIFT)
+        );
+        assert_eq!(
+            parse_modifier_key("Left-Shift"),
+            Some(KeyCode::KEY_LEFTSHIFT)
+        );
+        assert_eq!(
+            parse_modifier_key("RIGHTSHIFT"),
+            Some(KeyCode::KEY_RIGHTSHIFT)
+        );
+        assert_eq!(
+            parse_modifier_key("rightsuper"),
+            Some(KeyCode::KEY_RIGHTMETA)
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_names() {
+        assert_eq!(parse_modifier_key("capslock"), None);
+        assert_eq!(parse_modifier_key("a"), None);
+        assert_eq!(parse_modifier_key(""), None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

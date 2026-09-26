@@ -1,4 +1,5 @@
 mod config;
+mod control;
 mod dictionary;
 mod engine;
 mod hypr;
@@ -6,7 +7,7 @@ mod keymap;
 mod steam;
 mod typer;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use evdev::KeyCode;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,27 @@ struct Args {
     /// Path to config.toml (default: $XDG_CONFIG_HOME/linuxautoswitch/config.toml)
     #[arg(long)]
     config: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Print the running daemon's status.
+    Status {
+        /// Print raw JSON instead of a human-readable line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pause automatic correction (the daemon keeps running).
+    Pause,
+    /// Resume automatic correction.
+    Resume,
+    /// Toggle paused/running - the same effect as the pause hotkey.
+    Toggle,
+    /// Print status as JSON for a Waybar (or similar) custom module.
+    Waybar,
 }
 
 enum Event {
@@ -39,11 +61,18 @@ enum Event {
     Hypr(hypr::HyprEvent),
     /// A new keyboard device was plugged in.
     KeyboardsChanged,
+    Control(control::ControlEvent),
 }
 
 impl From<hypr::HyprEvent> for Event {
     fn from(ev: hypr::HyprEvent) -> Self {
         Event::Hypr(ev)
+    }
+}
+
+impl From<control::ControlEvent> for Event {
+    fn from(ev: control::ControlEvent) -> Self {
+        Event::Control(ev)
     }
 }
 
@@ -165,9 +194,74 @@ fn watch_device(path: PathBuf, mut device: evdev::Device, seen: Seen, tx: Sender
 }
 
 fn main() -> anyhow::Result<()> {
-    init_logging();
     let args = Args::parse();
-    let cfg = config::load(args.config)?;
+    match args.command {
+        Some(cmd) => run_client_command(cmd),
+        None => run_daemon(args.config),
+    }
+}
+
+/// A short-lived invocation (`status`/`pause`/`resume`/`toggle`/`waybar`)
+/// that talks to an already-running daemon over the control socket, prints
+/// a result, and exits - as opposed to the no-subcommand form, which *is*
+/// the daemon.
+fn run_client_command(cmd: Command) -> anyhow::Result<()> {
+    match cmd {
+        Command::Status { json } => print_status(&control::send_command("status")?, json),
+        Command::Pause => print_status(&control::send_command("pause")?, false),
+        Command::Resume => print_status(&control::send_command("resume")?, false),
+        Command::Toggle => print_status(&control::send_command("toggle")?, false),
+        Command::Waybar => {
+            let resp = control::send_command("status");
+            println!("{}", waybar_json(resp.as_ref().ok()));
+        }
+    }
+    Ok(())
+}
+
+fn print_status(resp: &control::ControlResponse, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(resp).unwrap_or_else(|_| "{}".to_string())
+        );
+        return;
+    }
+    if resp.paused {
+        println!("linuxautoswitch: paused");
+    } else {
+        let lang = resp.lang.as_deref().unwrap_or("unknown").to_uppercase();
+        let note = if resp.excluded {
+            " (current window is excluded)"
+        } else {
+            ""
+        };
+        println!("linuxautoswitch: running - layout {lang}{note}");
+    }
+}
+
+/// Waybar custom-module JSON: `{"text", "class", "tooltip"}`. `resp` is
+/// `None` when the daemon isn't reachable at all.
+fn waybar_json(resp: Option<&control::ControlResponse>) -> String {
+    let Some(resp) = resp else {
+        return r#"{"text":"?","class":"offline","tooltip":"linuxautoswitch is not running"}"#
+            .to_string();
+    };
+    let lang = resp.lang.as_deref().unwrap_or("--").to_uppercase();
+    if resp.paused {
+        return format!(
+            r#"{{"text":"⏸ {lang}","class":"paused","tooltip":"linuxautoswitch: paused"}}"#
+        );
+    }
+    let class = lang.to_lowercase();
+    format!(
+        r#"{{"text":"{lang}","class":"{class}","tooltip":"linuxautoswitch: running ({lang})"}}"#
+    )
+}
+
+fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
+    init_logging();
+    let cfg = config::load(config_path)?;
 
     tracing::info!("linuxautoswitch starting");
 
@@ -175,6 +269,13 @@ fn main() -> anyhow::Result<()> {
 
     // Hyprland event socket -> Event channel.
     hypr::listen(tx.clone());
+
+    // Control socket (status/pause/resume/toggle) -> Event channel. Not
+    // fatal if it fails (e.g. another instance is already running) - the
+    // core correction loop below works fine without it.
+    if let Err(e) = control::serve(tx.clone()) {
+        tracing::warn!("control socket not available: {e:#}");
+    }
 
     // One reader thread per physical keyboard device, including ones
     // plugged in later.
@@ -203,6 +304,10 @@ fn main() -> anyhow::Result<()> {
             } => engine.handle_key(&device, code, value),
             Event::Hypr(ev) => engine.handle_hypr(ev),
             Event::KeyboardsChanged => engine.refresh_keyboards(),
+            Event::Control(ev) => {
+                let response = engine.handle_control(ev.request);
+                let _ = ev.reply.send(response);
+            }
         }
     }
 

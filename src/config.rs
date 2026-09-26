@@ -8,6 +8,7 @@ pub struct Config {
     pub general: General,
     pub layouts: Layouts,
     pub hypr: HyprCfg,
+    pub hotkeys: Hotkeys,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -108,6 +109,34 @@ pub struct HyprCfg {
     /// multiple keyboards or if auto-detection picks the wrong one; find the
     /// right value with `hyprctl devices | grep -A2 Keyboard`.
     pub device_name_override: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct Hotkeys {
+    pub enabled: bool,
+    /// Key to double-tap to manually flip the last word to the other
+    /// language, bypassing the dictionary check entirely - for names,
+    /// jargon, or anything the automatic detection didn't recognize.
+    /// One of: leftshift, rightshift, leftctrl, rightctrl, leftalt,
+    /// rightalt, leftmeta/leftsuper, rightmeta/rightsuper.
+    pub manual_correct_key: String,
+    /// Maximum gap between the two taps, in milliseconds.
+    pub manual_correct_window_ms: u64,
+    /// Keys that, held down together, toggle the whole daemon
+    /// paused/running - same key names as `manual_correct_key` above.
+    pub toggle_pause_keys: Vec<String>,
+}
+
+impl Default for Hotkeys {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            manual_correct_key: "leftshift".to_string(),
+            manual_correct_window_ms: 400,
+            toggle_pause_keys: vec!["leftshift".to_string(), "rightshift".to_string()],
+        }
+    }
 }
 
 pub fn default_path() -> PathBuf {

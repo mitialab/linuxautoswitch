@@ -3,15 +3,26 @@
 
 use crate::config::Config;
 use crate::keymap::{self, Lang};
-use crate::{dictionary, hypr, steam, typer};
+use crate::{control, dictionary, hypr, steam, typer};
 use evdev::KeyCode;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
 struct TypedKey {
     code: KeyCode,
     shift: bool,
     capslock: bool,
+}
+
+/// The most recently completed word, kept around so the manual-flip hotkey
+/// can still act on it after the fact - e.g. after a word the automatic
+/// dictionary check didn't recognize (a name, jargon) has already had Space
+/// pressed after it.
+struct LastWord {
+    keys: Vec<TypedKey>,
+    /// Which language's text is actually on screen right now for these keys.
+    lang_on_screen: Lang,
 }
 
 /// One bit per physical modifier key, so releasing one side of a pair
@@ -61,6 +72,20 @@ pub struct Engine {
     /// `current_class`, refreshed only when focus changes rather than on
     /// every keystroke.
     excluded: bool,
+    /// Toggled by the pause hotkey or a `pause`/`resume`/`toggle` control
+    /// command; independent of `cfg.general.enabled`, which only sets the
+    /// starting state.
+    paused: bool,
+    last_word: Option<LastWord>,
+    /// The key to double-tap for a manual flip, resolved from
+    /// `cfg.hotkeys.manual_correct_key`; `None` if hotkeys are disabled or
+    /// the configured name didn't parse.
+    manual_correct_key: Option<KeyCode>,
+    manual_correct_window: Duration,
+    manual_correct_last_tap: Option<Instant>,
+    /// Modifier bits that must all be held to toggle pause, resolved from
+    /// `cfg.hotkeys.toggle_pause_keys`; 0 disables the hotkey.
+    toggle_pause_mask: u8,
     /// Hyprland keyboard device name -> last known active language.
     device_lang: HashMap<String, Lang>,
     /// The most recently observed active language on any keyboard, used
@@ -95,6 +120,19 @@ impl Engine {
             None => (String::new(), false),
         };
 
+        let manual_correct_key = if cfg.hotkeys.enabled {
+            resolve_hotkey_key("manual_correct_key", &cfg.hotkeys.manual_correct_key)
+        } else {
+            None
+        };
+        let toggle_pause_mask = if cfg.hotkeys.enabled {
+            resolve_hotkey_mask("toggle_pause_keys", &cfg.hotkeys.toggle_pause_keys)
+        } else {
+            0
+        };
+        let manual_correct_window = Duration::from_millis(cfg.hotkeys.manual_correct_window_ms);
+        let paused = !cfg.general.enabled;
+
         let mut engine = Self {
             cfg,
             buffer: Vec::new(),
@@ -103,6 +141,12 @@ impl Engine {
             capslock: false,
             current_class,
             excluded,
+            paused,
+            last_word: None,
+            manual_correct_key,
+            manual_correct_window,
+            manual_correct_last_tap: None,
+            toggle_pause_mask,
             device_lang: HashMap::new(),
             last_lang: None,
             keyboards: Vec::new(),
@@ -154,6 +198,9 @@ impl Engine {
             self.excluded = compute_excluded(&class, pid, &self.cfg);
             self.current_class = class;
             self.reset_word();
+            // A word sitting before the cursor in the app we just left
+            // behind isn't safe to retype into whatever's focused now.
+            self.last_word = None;
         }
     }
 
@@ -191,10 +238,42 @@ impl Engine {
         let held = value != 0;
 
         if let Some(bit) = modifier_bit(code) {
+            let was_held = self.modifiers & bit != 0;
             if held {
                 self.modifiers |= bit;
             } else {
                 self.modifiers &= !bit;
+            }
+
+            // Toggle-pause combo: fire once, on the transition into "every
+            // configured key held", not again on every autorepeat while
+            // they're kept down. Works regardless of `paused`/`excluded` -
+            // it has to, since it's the way out of `paused`.
+            if self.toggle_pause_mask != 0
+                && held
+                && !was_held
+                && self.modifiers & self.toggle_pause_mask == self.toggle_pause_mask
+            {
+                self.paused = !self.paused;
+                tracing::info!(paused = self.paused, "toggled pause via hotkey");
+                self.reset_word();
+            }
+
+            // Manual-flip double-tap: only a fresh key-down (not release or
+            // autorepeat) of the configured key counts as a tap.
+            if value == 1 && self.manual_correct_key == Some(code) {
+                let now = Instant::now();
+                let is_double_tap = self
+                    .manual_correct_last_tap
+                    .is_some_and(|t| now.duration_since(t) <= self.manual_correct_window);
+                if is_double_tap {
+                    // Consumed: a third tap starts a fresh pair rather than
+                    // firing again immediately.
+                    self.manual_correct_last_tap = None;
+                    self.manual_flip(source_device);
+                } else {
+                    self.manual_correct_last_tap = Some(now);
+                }
             }
             return;
         }
@@ -209,7 +288,7 @@ impl Engine {
             return; // everything below only reacts to key-down and autorepeat
         }
 
-        if !self.cfg.general.enabled || self.excluded {
+        if self.paused || self.excluded {
             self.reset_word();
             return;
         }
@@ -263,6 +342,20 @@ impl Engine {
         if code == KeyCode::KEY_SPACE {
             self.try_correct(source_device, " ", self.cfg.general.min_word_length);
         }
+        // If a correction just fired, the buffer is already empty and
+        // already stashed as `last_word` by `try_correct`. Otherwise - the
+        // word was fine, too short to check, or not recognized in either
+        // language - stash it anyway: this is exactly the case the manual
+        // flip hotkey exists for, words the automatic check didn't touch.
+        if !self.buffer.is_empty() && !self.overflowed {
+            let device_name = self.resolve_hypr_device_name(source_device);
+            if let Some(lang) = self.lang_for_device(device_name.as_deref()) {
+                self.last_word = Some(LastWord {
+                    keys: self.buffer.clone(),
+                    lang_on_screen: lang,
+                });
+            }
+        }
         self.reset_word();
     }
 
@@ -288,6 +381,7 @@ impl Engine {
             return false;
         };
 
+        let keys_snapshot = self.buffer.clone();
         let backspaces = self.buffer.len() + boundary.chars().count();
         if let Err(e) = typer::correct_word(backspaces, &format!("{corrected}{boundary}")) {
             tracing::warn!("failed to retype corrected word: {e:#}");
@@ -297,6 +391,13 @@ impl Engine {
         // switch below succeeds - don't let a stale buffer trigger another
         // correction on top of this one.
         self.reset_word();
+        // The word now on screen is in `other_lang` - if it's still wrong
+        // (a name that happened to also look wrong in the dictionary's
+        // eyes), the manual flip hotkey can undo this.
+        self.last_word = Some(LastWord {
+            keys: keys_snapshot,
+            lang_on_screen: other_lang,
+        });
 
         match device_name {
             Some(device_name) => {
@@ -359,6 +460,155 @@ impl Engine {
             .or_else(|| self.keyboards.first())
             .map(|k| k.name.clone())
     }
+
+    /// Flips the word under the cursor to the other language, bypassing the
+    /// dictionary check entirely - for words the automatic detection didn't
+    /// recognize (names, jargon, anything not in either dictionary).
+    /// Prefers the word still being typed, if there is one; otherwise falls
+    /// back to the last completed word.
+    fn manual_flip(&mut self, source_device: &str) {
+        if self.paused || self.excluded {
+            return;
+        }
+
+        if !self.buffer.is_empty() && !self.overflowed {
+            let device_name = self.resolve_hypr_device_name(source_device);
+            let Some(current_lang) = self.lang_for_device(device_name.as_deref()) else {
+                return;
+            };
+            let keys = self.buffer.clone();
+            if let Some(new_lang) = self.flip_and_retype(&keys, current_lang, source_device) {
+                // The physical keys don't change; only note what's now on
+                // screen, in case the word ends right after this.
+                self.last_word = Some(LastWord {
+                    keys,
+                    lang_on_screen: new_lang,
+                });
+            }
+            return;
+        }
+
+        if let Some(LastWord {
+            keys,
+            lang_on_screen,
+        }) = self.last_word.take()
+            && let Some(new_lang) = self.flip_and_retype(&keys, lang_on_screen, source_device)
+        {
+            // Toggle back and forth on repeated presses, same as Caramba.
+            self.last_word = Some(LastWord {
+                keys,
+                lang_on_screen: new_lang,
+            });
+        }
+    }
+
+    /// Retypes `keys` (currently shown as `on_screen_lang`) as the other
+    /// language and switches the active layout to match. Returns the new
+    /// on-screen language on success.
+    fn flip_and_retype(
+        &mut self,
+        keys: &[TypedKey],
+        on_screen_lang: Lang,
+        source_device: &str,
+    ) -> Option<Lang> {
+        let (corrected, target_lang) = flipped(keys, on_screen_lang)?;
+        tracing::info!(to = %corrected, ?target_lang, "manually flipping word");
+
+        if let Err(e) = typer::correct_word(keys.len(), &corrected) {
+            tracing::warn!("failed to retype flipped word: {e:#}");
+            return None;
+        }
+
+        match self.resolve_hypr_device_name(source_device) {
+            Some(device_name) => {
+                let index = match target_lang {
+                    Lang::En => self.cfg.layouts.english_index,
+                    Lang::Ru => self.cfg.layouts.russian_index,
+                };
+                match hypr::switch_layout(&device_name, index) {
+                    Ok(()) => {
+                        self.device_lang.insert(device_name, target_lang);
+                        self.last_lang = Some(target_lang);
+                    }
+                    Err(e) => tracing::warn!("failed to switch layout: {e:#}"),
+                }
+            }
+            None => tracing::warn!(
+                "could not resolve a hyprland keyboard device for '{source_device}'; \
+                 set `hypr.device_name_override` in the config"
+            ),
+        }
+        Some(target_lang)
+    }
+
+    /// Answers a request from the control socket (`linuxautoswitch status` /
+    /// `pause` / `resume` / `toggle`).
+    pub fn handle_control(&mut self, request: control::ControlRequest) -> control::ControlResponse {
+        match request {
+            control::ControlRequest::Status => {}
+            control::ControlRequest::Pause => self.paused = true,
+            control::ControlRequest::Resume => self.paused = false,
+            control::ControlRequest::Toggle => self.paused = !self.paused,
+        }
+        control::ControlResponse {
+            paused: self.paused,
+            lang: self.last_lang.map(|lang| match lang {
+                Lang::En => "en".to_string(),
+                Lang::Ru => "ru".to_string(),
+            }),
+            excluded: self.excluded,
+        }
+    }
+}
+
+/// The `(text, language)` a word would become if manually flipped from
+/// `on_screen_lang`, bypassing the dictionary check entirely.
+fn flipped(keys: &[TypedKey], on_screen_lang: Lang) -> Option<(String, Lang)> {
+    if keys.is_empty() {
+        return None;
+    }
+    let target_lang = on_screen_lang.other();
+    let on_screen_text: String = keys
+        .iter()
+        .filter_map(|k| keymap::char_for(k.code, k.shift, k.capslock, on_screen_lang))
+        .collect();
+    let target_text: String = keys
+        .iter()
+        .filter_map(|k| keymap::char_for(k.code, k.shift, k.capslock, target_lang))
+        .collect();
+    Some((
+        apply_case_pattern(&on_screen_text, &target_text),
+        target_lang,
+    ))
+}
+
+/// Resolves one hotkey key name from config, warning and returning `None`
+/// (disabling that hotkey) if it doesn't parse.
+fn resolve_hotkey_key(field: &str, name: &str) -> Option<KeyCode> {
+    let key = keymap::parse_modifier_key(name);
+    if key.is_none() {
+        tracing::warn!("invalid hotkeys.{field} '{name}', that hotkey is disabled");
+    }
+    key
+}
+
+/// Resolves a combo of hotkey key names into a modifier bitmask; 0 (and a
+/// warning) if any of them don't parse, or the list is empty.
+fn resolve_hotkey_mask(field: &str, names: &[String]) -> u8 {
+    if names.is_empty() {
+        return 0;
+    }
+    let mut mask = 0u8;
+    for name in names {
+        match keymap::parse_modifier_key(name).and_then(modifier_bit) {
+            Some(bit) => mask |= bit,
+            None => {
+                tracing::warn!("invalid key '{name}' in hotkeys.{field}, that hotkey is disabled");
+                return 0;
+            }
+        }
+    }
+    mask
 }
 
 /// Corrections never fire below this length, regardless of config: a single
@@ -688,5 +938,118 @@ mod tests {
     #[test]
     fn case_pattern_lowercase() {
         assert_eq!(apply_case_pattern("ghbdtn", "привет"), "привет");
+    }
+
+    #[test]
+    fn manual_flip_ignores_dictionary_validity() {
+        // q x z is gibberish in both languages (like a name would be) -
+        // exactly the case the dictionary-based corrector never touches,
+        // but the manual flip hotkey should still work on.
+        let codes = [KeyCode::KEY_Q, KeyCode::KEY_X, KeyCode::KEY_Z];
+        let (text, lang) = flipped(&keys(&codes), Lang::En).unwrap();
+        assert_eq!(lang, Lang::Ru);
+        assert_eq!(text, "йчя");
+        // And flipping back returns the original.
+        let (back, lang2) = flipped(&keys(&codes), Lang::Ru).unwrap();
+        assert_eq!(lang2, Lang::En);
+        assert_eq!(back, "qxz");
+    }
+
+    #[test]
+    fn manual_flip_preserves_capitalization() {
+        let codes = [
+            TypedKey {
+                code: KeyCode::KEY_Q,
+                shift: true,
+                capslock: false,
+            },
+            TypedKey {
+                code: KeyCode::KEY_X,
+                shift: false,
+                capslock: false,
+            },
+        ];
+        let (text, _) = flipped(&codes, Lang::En).unwrap();
+        assert_eq!(text, "Йч");
+    }
+
+    #[test]
+    fn flipped_is_none_for_empty_word() {
+        assert_eq!(flipped(&[], Lang::En), None);
+    }
+
+    #[test]
+    fn both_shifts_together_toggle_pause() {
+        let mut engine = Engine::new(Config::default());
+        assert!(!engine.paused);
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
+        assert!(!engine.paused, "one shift alone shouldn't toggle pause");
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, DOWN);
+        assert!(engine.paused, "both shifts together should toggle pause");
+
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, 0);
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, 0);
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, DOWN);
+        assert!(!engine.paused, "pressing both again should toggle back off");
+    }
+
+    #[test]
+    fn toggle_pause_does_not_refire_on_autorepeat() {
+        let mut engine = Engine::new(Config::default());
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, DOWN);
+        assert!(engine.paused);
+        // Autorepeat of an already-held modifier shouldn't be possible in
+        // practice, but even if it arrived, it must not re-toggle.
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, REPEAT);
+        assert!(engine.paused);
+    }
+
+    #[test]
+    fn double_tap_manual_correct_key_consumes_the_pair() {
+        let mut cfg = Config::default();
+        cfg.hotkeys.manual_correct_window_ms = 10_000; // avoid timing flakiness
+        let mut engine = Engine::new(cfg);
+        engine.last_lang = Some(Lang::En);
+        assert!(engine.manual_correct_last_tap.is_none());
+
+        // Tap 1: press and release - just a single tap, not a trigger yet.
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
+        assert!(engine.manual_correct_last_tap.is_some());
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, 0);
+
+        // Tap 2, within the window: this is the double-tap. The pair is
+        // consumed (reset to None) so a third tap starts fresh rather than
+        // firing again immediately.
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
+        assert!(engine.manual_correct_last_tap.is_none());
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, 0);
+
+        // Tap 3: starts a new pair.
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
+        assert!(engine.manual_correct_last_tap.is_some());
+    }
+
+    #[test]
+    fn pause_hotkey_disabled_when_hotkeys_disabled() {
+        let mut cfg = Config::default();
+        cfg.hotkeys.enabled = false;
+        let engine = Engine::new(cfg);
+        assert_eq!(engine.toggle_pause_mask, 0);
+        assert_eq!(engine.manual_correct_key, None);
+    }
+
+    #[test]
+    fn control_toggle_flips_paused_and_reports_state() {
+        let mut engine = Engine::new(Config::default());
+        engine.last_lang = Some(Lang::Ru);
+        let resp = engine.handle_control(control::ControlRequest::Toggle);
+        assert!(resp.paused);
+        assert_eq!(resp.lang.as_deref(), Some("ru"));
+        let resp = engine.handle_control(control::ControlRequest::Status);
+        assert!(resp.paused);
+        let resp = engine.handle_control(control::ControlRequest::Resume);
+        assert!(!resp.paused);
     }
 }
