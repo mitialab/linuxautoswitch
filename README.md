@@ -1,11 +1,18 @@
 # linuxautoswitch
 
+**Language:** English | [Русский](README.ru.md)
+
 Automatic EN/RU keyboard layout correction for [Omarchy](https://omarchy.org)
-(Hyprland). Inspired by [Caramba
-Switcher](https://caramba.io) / the classic Windows tool Punto Switcher: type
-a word in the wrong layout - `ghbdtn` instead of `привет` - and it's detected
-and fixed automatically: the wrong text is deleted, your keyboard layout is
-switched, and the correct word is retyped.
+(Hyprland). Inspired by [Caramba Switcher](https://caramba.io) and the
+classic Windows tool Punto Switcher: type a word in the wrong layout -
+`ghbdtn` instead of `привет` - and it's detected and fixed automatically:
+the wrong text is deleted, your keyboard layout is switched, and the correct
+word is retyped.
+
+> Built on the word lists from [dwyl/english-words](https://github.com/dwyl/english-words)
+> and [danakt/russian-words](https://github.com/danakt/russian-words), and on
+> [`wtype`](https://github.com/atx/wtype) for typing corrections back into
+> Wayland apps. Full credits at the bottom of this file.
 
 ## How it works
 
@@ -46,37 +53,61 @@ instead of trying to enumerate every game's window class.
 ## Requirements
 
 - [Omarchy](https://omarchy.org) or any Hyprland-based Wayland session
-- [`wtype`](https://github.com/atx/wtype) (`sudo pacman -S wtype`)
-- Your user must be in the `input` group to read raw keyboard events
-  (`install.sh` handles this)
-- Rust toolchain to build (`sudo pacman -S rust`)
+- [`wtype`](https://github.com/atx/wtype)
+- Rust toolchain (to build)
+- Your user in the `input` group, to read raw keyboard events (the installer
+  handles this for you)
 
 ## Install
 
-```sh
-git clone https://github.com/mitialab/linuxautoswitch
-cd linuxautoswitch
-./install.sh
-```
+1. **Install the two system dependencies** (Omarchy is Arch-based, so
+   `pacman` works out of the box):
 
-This builds a release binary, installs it to `~/.local/bin`, installs a
-`systemd --user` unit, writes a default config to
-`~/.config/linuxautoswitch/config.toml`, and starts the service.
+   ```sh
+   sudo pacman -S wtype rust
+   ```
 
-If you're not already in the `input` group, the script adds you to it - log
-out and back in, then run it again (or just start the service once you're
-back).
+2. **Clone this repository** and enter it:
 
-```sh
-systemctl --user status linuxautoswitch
-journalctl --user -u linuxautoswitch -f
-```
+   ```sh
+   git clone https://github.com/mitialab/linuxautoswitch
+   cd linuxautoswitch
+   ```
+
+3. **Run the installer:**
+
+   ```sh
+   ./install.sh
+   ```
+
+   This builds a release binary, installs it to `~/.local/bin`, installs a
+   `systemd --user` unit, writes a default config to
+   `~/.config/linuxautoswitch/config.toml`, and enables and starts the
+   service.
+
+4. **If you weren't already in the `input` group**, the installer adds you
+   to it and tells you to do so - this needs a fresh login to take effect:
+
+   ```sh
+   # log out and back in (or reboot), then:
+   cd linuxautoswitch && ./install.sh
+   ```
+
+5. **Check that it's running:**
+
+   ```sh
+   systemctl --user status linuxautoswitch
+   journalctl --user -u linuxautoswitch -f
+   ```
+
+   Try typing a word in the wrong layout (e.g. type `ghbdtn` with an
+   English layout active) - it should turn into `привет` automatically.
 
 ### Manual start (no systemd)
 
 If your session doesn't propagate environment variables into
 `systemd --user` (some non-UWSM Hyprland setups don't), add this to your
-Hyprland config instead:
+Hyprland config instead of using the systemd service:
 
 ```
 exec-once = /home/you/.local/bin/linuxautoswitch
@@ -95,6 +126,13 @@ Key settings:
   via the `SteamAppId` env var rather than window class)
 - `general.eager_correction` - correct mid-word, on every keystroke, instead
   of waiting for space/enter (on by default; see limitations below)
+- `general.min_word_length` / `general.eager_min_word_length` - two separate
+  thresholds on purpose: a word confirmed complete by pressing Space can be
+  trusted even if short (`min_word_length`, default 2 - catches "да", "но"),
+  while a still-growing buffer checked mid-word needs a higher bar
+  (`eager_min_word_length`, default 4) since a short one might just be the
+  first letters of something longer. Single-letter words are never
+  corrected, regardless of either setting.
 - `layouts.english_index` / `russian_index` - must match the order of
   `kb_layout` in your Hyprland config (e.g. `kb_layout = us,ru` means
   `english_index = 0`, `russian_index = 1`)
@@ -130,8 +168,24 @@ rm ~/.local/bin/linuxautoswitch ~/.config/systemd/user/linuxautoswitch.service
 systemctl --user daemon-reload
 ```
 
-## License
+## Credits
 
-Dictionary sources: [dwyl/english-words](https://github.com/dwyl/english-words)
-(Unlicense) and [danakt/russian-words](https://github.com/danakt/russian-words)
-(MIT).
+This project wouldn't work without:
+
+- **Concept**: [Caramba Switcher](https://caramba.io) (macOS/Windows) and
+  the original Punto Switcher, whose "type it wrong, get it fixed
+  automatically" approach this project ports to Linux/Hyprland.
+- **Dictionaries**: [dwyl/english-words](https://github.com/dwyl/english-words)
+  (~370k words, Unlicense/public domain) and
+  [danakt/russian-words](https://github.com/danakt/russian-words) (~1.5M word
+  forms, MIT license) - embedded directly as the wrong-layout detection data.
+- **[`wtype`](https://github.com/atx/wtype)** - does the actual work of
+  retyping corrections into Wayland apps, via the
+  `virtual-keyboard-unstable-v1` protocol.
+- **[Hyprland](https://hyprland.org)** - the compositor this is built for,
+  and whose IPC (`hyprctl`, the event socket) drives window/layout
+  detection and switching.
+- **Rust crates**: [`evdev`](https://crates.io/crates/evdev) for raw
+  keyboard input, [`fst`](https://crates.io/crates/fst) (BurntSushi) for the
+  compact embedded dictionaries, plus `clap`, `serde`, `toml`, `tracing`,
+  and `anyhow`.

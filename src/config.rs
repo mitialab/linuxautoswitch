@@ -14,8 +14,16 @@ pub struct Config {
 #[serde(default)]
 pub struct General {
     pub enabled: bool,
-    /// Words shorter than this are never auto-corrected: too easy to get a
-    /// spurious dictionary hit on 1-2 letter "words".
+    /// Minimum length for a correction triggered by pressing Space after a
+    /// word. Kept lower than `eager_min_word_length` on purpose: by the time
+    /// Space is pressed the word is confirmed *complete* (nothing more is
+    /// coming), so a short word like "да" or "но" can be trusted the same
+    /// as a long one. `eager_min_word_length` below is for mid-word
+    /// checking, where a short buffer might still just be the first two
+    /// letters of something longer. 1-letter words are never corrected
+    /// regardless of this setting - too easy to get a spurious hit, and too
+    /// disruptive when they're a real single-letter word, an initial, or an
+    /// abbreviation.
     pub min_word_length: usize,
     /// Window classes (as reported by `hyprctl activewindow`) to never
     /// touch: terminals, password managers, anywhere retyping text is
@@ -45,7 +53,7 @@ impl Default for General {
     fn default() -> Self {
         Self {
             enabled: true,
-            min_word_length: 3,
+            min_word_length: 2,
             excluded_classes: [
                 "kitty",
                 "foot",
