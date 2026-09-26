@@ -3,6 +3,7 @@ mod dictionary;
 mod engine;
 mod hypr;
 mod keymap;
+mod steam;
 mod typer;
 
 use clap::Parser;

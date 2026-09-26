@@ -5,23 +5,29 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::Path;
 
-fn build_fst(src: &str, dst: &Path) {
-    println!("cargo:rerun-if-changed={src}");
-
-    let text = fs::read_to_string(src).unwrap_or_else(|e| panic!("failed to read {src}: {e}"));
+fn build_fst(sources: &[&str], dst: &Path) {
+    let texts: Vec<String> = sources
+        .iter()
+        .map(|src| {
+            println!("cargo:rerun-if-changed={src}");
+            fs::read_to_string(src).unwrap_or_else(|e| panic!("failed to read {src}: {e}"))
+        })
+        .collect();
 
     // Sort and deduplicate first: `fst::SetBuilder` requires strictly
-    // increasing keys, and this keeps the build robust even if the source
-    // wordlist is ever edited out of order. Borrowing lines from one buffer
+    // increasing keys, and this keeps the build robust even if a source
+    // wordlist is ever edited out of order. Borrowing lines from `texts`
     // avoids a heap allocation per word, and sorting an already-sorted list
     // is close to linear.
     let mut words: Vec<Cow<str>> = Vec::new();
-    for word in text.lines().map(str::trim).filter(|w| !w.is_empty()) {
-        // Most people type Russian `ё` as `е`, so accept that spelling too.
-        if word.contains('ё') {
-            words.push(Cow::Owned(word.replace('ё', "е")));
+    for text in &texts {
+        for word in text.lines().map(str::trim).filter(|w| !w.is_empty()) {
+            // Most people type Russian `ё` as `е`, so accept that spelling too.
+            if word.contains('ё') {
+                words.push(Cow::Owned(word.replace('ё', "е")));
+            }
+            words.push(Cow::Borrowed(word));
         }
-        words.push(Cow::Borrowed(word));
     }
     words.sort_unstable();
     words.dedup();
@@ -42,11 +48,17 @@ fn build_fst(src: &str, dst: &Path) {
 fn main() {
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
     build_fst(
-        "assets/dictionaries/en_raw.txt",
+        &[
+            "assets/dictionaries/en_raw.txt",
+            "assets/dictionaries/en_extra.txt",
+        ],
         &Path::new(&out_dir).join("en.fst"),
     );
     build_fst(
-        "assets/dictionaries/ru_raw.txt",
+        &[
+            "assets/dictionaries/ru_raw.txt",
+            "assets/dictionaries/ru_extra.txt",
+        ],
         &Path::new(&out_dir).join("ru.fst"),
     );
 }
