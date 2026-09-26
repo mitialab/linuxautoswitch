@@ -220,18 +220,19 @@ before giving up, rather than risking a race where the host shows up a
 moment after the daemon's own one-shot registration attempt and the icon
 silently never appears for the rest of the session.
 
-The icon's colors come from Omarchy's active theme when one is set - the
-circle is filled with the theme's `muted` color (the same in both states;
-paused vs. running is shown by the symbol, not the color), read from the
-same `~/.local/state/omarchy/current/theme/colors.toml` Omarchy's own
-Quickshell shell reads, with the letter drawn in black or white depending
-on which contrasts better against that fill. `accent` is deliberately not
-used: most tray icons are symbolic icons the tray host recolors to its own
-monochrome foreground color, and a raw pixmap icon like this one can't be
-retinted that way, so a theme's (often saturated) accent color would just
-clash with everything next to it. Outside Omarchy (or before a theme is
-set), it falls back to a plain grey scheme - the same fallback values
-Omarchy's shell itself uses when unthemed.
+The circle is a fixed neutral grey (the same regardless of paused/running
+state - that's shown by the symbol instead), with the letter drawn in
+black or white depending on which contrasts better. It's deliberately
+*not* colored from Omarchy's active theme: an earlier version filled it
+with the theme's `accent`/`muted` color from
+`~/.local/state/omarchy/current/theme/colors.toml`, but those are semantic
+roles, not a promise of being visually neutral - on at least one real
+theme `muted` turned out to be a saturated navy blue. Most other tray
+icons are symbolic icons the tray host recolors to its own monochrome
+foreground color, but this one is a raw ARGB pixmap that can't be
+retinted that way, so any theme color risks clashing with the genuinely
+monochrome icons next to it instead of blending in. A fixed grey avoids
+that regardless of which theme is active.
 
 If you don't have a tray host and would rather not set one up, the
 `waybar` subcommand below gives you the same information as a plain bar

@@ -10,15 +10,14 @@
 //! The icon itself is drawn at runtime as a small ARGB circle (a single
 //! letter - "E"/"Р" - in a hand-rolled 5x7 pixel font, on a solid disc)
 //! rather than shipped as image files - no icon-theme installation step, no
-//! extra asset files to keep in sync. Colors come from Omarchy's active
-//! theme when running under it (see `load_theme_colors` below), falling
-//! back to a plain grey scheme otherwise.
+//! extra asset files to keep in sync. The disc is filled with a fixed
+//! neutral grey rather than a color pulled from Omarchy's active theme (see
+//! the note on `FILL` below for why).
 
 use crate::keymap::Lang;
 use ksni::Icon;
 use ksni::blocking::TrayMethods;
 use ksni::menu::StandardItem;
-use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -168,80 +167,16 @@ const FONT_HEIGHT: usize = 7;
 
 type Rgb = (u8, u8, u8);
 
-/// The subset of Omarchy's theme palette (see `load_theme_colors`) this icon
-/// needs. Field names and fallback values match Omarchy's own Quickshell
-/// shell (`shell/Commons/Color.qml`) exactly, so an unthemed icon looks like
-/// an unthemed *shell* - a plain grey scheme - rather than an arbitrary
-/// palette of our own invention.
-#[derive(Clone, Copy, PartialEq, Debug)]
-struct ThemeColors {
-    background: Rgb,
-    foreground: Rgb,
-    accent: Rgb,
-    muted: Rgb,
-}
-
-impl Default for ThemeColors {
-    fn default() -> Self {
-        Self {
-            background: (0x10, 0x13, 0x15),
-            foreground: (0xca, 0xcc, 0xcc),
-            accent: (0xca, 0xcc, 0xcc),
-            muted: (0x70, 0x78, 0x80),
-        }
-    }
-}
-
-fn theme_colors_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".local/state/omarchy/current/theme/colors.toml"))
-}
-
-/// Reads Omarchy's active theme colors from the same file its own shell
-/// does (`~/.local/state/omarchy/current/theme/colors.toml`, generated per
-/// theme by `omarchy-theme-colors-from-alacritty`: flat `key = "#rrggbb"`
-/// lines), so the tray icon matches the desktop instead of a palette we
-/// made up. Falls back to `ThemeColors::default()` - the same grey scheme
-/// Omarchy's shell itself falls back to - when the file is missing or a
-/// field isn't present (not running under Omarchy, or no theme set yet).
-fn load_theme_colors() -> ThemeColors {
-    let mut colors = ThemeColors::default();
-    let Some(path) = theme_colors_path() else {
-        return colors;
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return colors;
-    };
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let Some(rgb) = parse_hex_color(value) else {
-            continue;
-        };
-        match key.trim() {
-            "background" => colors.background = rgb,
-            "foreground" => colors.foreground = rgb,
-            "accent" => colors.accent = rgb,
-            "muted" => colors.muted = rgb,
-            _ => {}
-        }
-    }
-    colors
-}
-
-/// Parses `"#rrggbb"` (quotes optional) into RGB components.
-fn parse_hex_color(s: &str) -> Option<Rgb> {
-    let s = s.trim().trim_matches(['"', '\'']);
-    let s = s.strip_prefix('#')?;
-    if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
-    Some((r, g, b))
-}
+/// The disc's fill color. Deliberately a fixed neutral grey rather than
+/// anything pulled from Omarchy's active theme (its `colors.toml`'s
+/// `accent`/`muted` fields, which an earlier version of this icon used):
+/// those are semantic roles, not a promise of being visually neutral - on
+/// at least one real theme `muted` is a saturated navy blue, which made
+/// this icon (a raw ARGB pixmap, so unlike other tray items it can't be
+/// recolored by the tray host to match) stand out against the genuinely
+/// monochrome symbolic icons next to it instead of blending in. This value
+/// was picked to match that observed neutral tray-icon grey directly.
+const FILL: Rgb = (0xa0, 0xa0, 0xa0);
 
 /// Picks black or white text for readability over `bg`, using perceived
 /// luminance (ITU-R BT.601) rather than assuming any particular theme
@@ -337,22 +272,14 @@ fn draw_pause_bars_centered(buf: &mut [u8], color: Rgb) {
     }
 }
 
-/// Renders the tray icon: a disc filled with `theme.accent` (or
-/// `theme.muted` while paused) with either a single "E"/"P" letter or a
-/// pause symbol in a contrasting color on top.
-fn render_icon_with_theme(paused: bool, lang: Option<Lang>, theme: ThemeColors) -> Icon {
-    // A flat grey badge in the theme's `muted` tone, the same regardless of
-    // state or language - not `accent`. Other tray items are usually
-    // symbolic icons that a real tray host recolors to its own monochrome
-    // `bar.text`/foreground; a raw pixmap icon like this one can't be
-    // retinted that way, so using a saturated accent color here just makes
-    // it visually clash with everything next to it. Paused vs running is
-    // conveyed by the symbol drawn on top, not by color.
-    let fill = theme.muted;
-    let text_color = contrasting_text(fill);
+/// Renders the tray icon: a grey disc (see `FILL`) with either a single
+/// "E"/"P" letter or a pause symbol in a contrasting color on top. Paused
+/// vs. running is conveyed by that symbol, not by color.
+fn render_icon(paused: bool, lang: Option<Lang>) -> Icon {
+    let text_color = contrasting_text(FILL);
 
     let mut data = vec![0u8; (ICON_SIZE * ICON_SIZE * 4) as usize];
-    draw_disc(&mut data, ICON_SIZE as f64 / 2.0 - 1.0, fill);
+    draw_disc(&mut data, ICON_SIZE as f64 / 2.0 - 1.0, FILL);
 
     if paused {
         draw_pause_bars_centered(&mut data, text_color);
@@ -372,10 +299,6 @@ fn render_icon_with_theme(paused: bool, lang: Option<Lang>, theme: ThemeColors) 
     }
 }
 
-fn render_icon(paused: bool, lang: Option<Lang>) -> Icon {
-    render_icon_with_theme(paused, lang, load_theme_colors())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,16 +313,9 @@ mod tests {
         ]
     }
 
-    const THEME: ThemeColors = ThemeColors {
-        background: (0x10, 0x13, 0x15),
-        foreground: (0xca, 0xcc, 0xcc),
-        accent: (0x4a, 0x9e, 0xff), // an arbitrary blue, distinct from grey
-        muted: (0x70, 0x78, 0x80),
-    };
-
     #[test]
     fn icon_has_expected_dimensions() {
-        let icon = render_icon_with_theme(false, Some(Lang::En), THEME);
+        let icon = render_icon(false, Some(Lang::En));
         assert_eq!(icon.width, ICON_SIZE);
         assert_eq!(icon.height, ICON_SIZE);
         assert_eq!(icon.data.len(), (ICON_SIZE * ICON_SIZE * 4) as usize);
@@ -407,15 +323,12 @@ mod tests {
 
     #[test]
     fn corner_pixels_are_transparent_outside_the_circle() {
-        let icon = render_icon_with_theme(false, Some(Lang::En), THEME);
+        let icon = render_icon(false, Some(Lang::En));
         assert_eq!(pixel(&icon, 0, 0)[0], 0, "corner alpha should be 0");
     }
 
     #[test]
-    fn fill_is_muted_grey_regardless_of_state_or_language() {
-        // Not `accent`: other tray items are usually monochrome symbolic
-        // icons recolored to the bar's foreground, and a saturated accent
-        // fill would stand out against them rather than match.
+    fn fill_is_the_fixed_grey_regardless_of_state_or_language() {
         let center = ICON_SIZE / 2;
         for (paused, lang) in [
             (false, Some(Lang::En)),
@@ -424,20 +337,17 @@ mod tests {
             (true, Some(Lang::En)),
             (true, None),
         ] {
-            let icon = render_icon_with_theme(paused, lang, THEME);
+            let icon = render_icon(paused, lang);
             // Off to the side of the centered glyph, still plain fill color.
             assert_eq!(pixel(&icon, 4, center)[0], 255, "should be inside the disc");
-            assert_eq!(
-                pixel(&icon, 4, center),
-                [255, THEME.muted.0, THEME.muted.1, THEME.muted.2]
-            );
+            assert_eq!(pixel(&icon, 4, center), [255, FILL.0, FILL.1, FILL.2]);
         }
     }
 
     #[test]
     fn running_draws_a_contrasting_letter() {
-        let icon = render_icon_with_theme(false, Some(Lang::Ru), THEME);
-        let text = contrasting_text(THEME.muted);
+        let icon = render_icon(false, Some(Lang::Ru));
+        let text = contrasting_text(FILL);
         assert!(
             icon.data
                 .chunks_exact(4)
@@ -447,8 +357,8 @@ mod tests {
 
     #[test]
     fn paused_draws_contrasting_bars() {
-        let icon = render_icon_with_theme(true, None, THEME);
-        let text = contrasting_text(THEME.muted);
+        let icon = render_icon(true, None);
+        let text = contrasting_text(FILL);
         assert!(
             icon.data
                 .chunks_exact(4)
@@ -460,26 +370,5 @@ mod tests {
     fn contrasting_text_picks_white_on_dark_black_on_light() {
         assert_eq!(contrasting_text((0x10, 0x10, 0x10)), (0xff, 0xff, 0xff));
         assert_eq!(contrasting_text((0xf0, 0xf0, 0xf0)), (0x1a, 0x1a, 0x1a));
-    }
-
-    #[test]
-    fn parses_quoted_and_unquoted_hex_colors() {
-        assert_eq!(parse_hex_color("\"#aabbcc\""), Some((0xaa, 0xbb, 0xcc)));
-        assert_eq!(parse_hex_color("#001122"), Some((0x00, 0x11, 0x22)));
-        assert_eq!(parse_hex_color("not-a-color"), None);
-        assert_eq!(parse_hex_color("#zzzzzz"), None);
-    }
-
-    #[test]
-    fn default_theme_matches_omarchy_shells_own_fallback() {
-        // Keep this in sync with shell/Commons/Color.qml's hardcoded
-        // fallback values in Omarchy's own Quickshell shell - the whole
-        // point of matching them is an unthemed icon looking like an
-        // unthemed *shell*, not an arbitrary palette of our own.
-        let theme = ThemeColors::default();
-        assert_eq!(theme.background, (0x10, 0x13, 0x15));
-        assert_eq!(theme.foreground, (0xca, 0xcc, 0xcc));
-        assert_eq!(theme.accent, (0xca, 0xcc, 0xcc));
-        assert_eq!(theme.muted, (0x70, 0x78, 0x80));
     }
 }
