@@ -341,7 +341,14 @@ fn draw_pause_bars_centered(buf: &mut [u8], color: Rgb) {
 /// `theme.muted` while paused) with either a single "E"/"P" letter or a
 /// pause symbol in a contrasting color on top.
 fn render_icon_with_theme(paused: bool, lang: Option<Lang>, theme: ThemeColors) -> Icon {
-    let fill = if paused { theme.muted } else { theme.accent };
+    // A flat grey badge in the theme's `muted` tone, the same regardless of
+    // state or language - not `accent`. Other tray items are usually
+    // symbolic icons that a real tray host recolors to its own monochrome
+    // `bar.text`/foreground; a raw pixmap icon like this one can't be
+    // retinted that way, so using a saturated accent color here just makes
+    // it visually clash with everything next to it. Paused vs running is
+    // conveyed by the symbol drawn on top, not by color.
+    let fill = theme.muted;
     let text_color = contrasting_text(fill);
 
     let mut data = vec![0u8; (ICON_SIZE * ICON_SIZE * 4) as usize];
@@ -405,32 +412,32 @@ mod tests {
     }
 
     #[test]
-    fn center_uses_accent_color_while_running() {
-        let icon = render_icon_with_theme(false, None, THEME);
-        // Center of the disc, off to the side of the centered glyph, is
-        // still the plain fill color.
+    fn fill_is_muted_grey_regardless_of_state_or_language() {
+        // Not `accent`: other tray items are usually monochrome symbolic
+        // icons recolored to the bar's foreground, and a saturated accent
+        // fill would stand out against them rather than match.
         let center = ICON_SIZE / 2;
-        assert_eq!(pixel(&icon, 4, center)[0], 255, "should be inside the disc");
-        assert_eq!(
-            pixel(&icon, 4, center),
-            [255, THEME.accent.0, THEME.accent.1, THEME.accent.2]
-        );
-    }
-
-    #[test]
-    fn paused_uses_muted_color_regardless_of_language() {
-        let icon = render_icon_with_theme(true, Some(Lang::En), THEME);
-        let center = ICON_SIZE / 2;
-        assert_eq!(
-            pixel(&icon, 4, center),
-            [255, THEME.muted.0, THEME.muted.1, THEME.muted.2]
-        );
+        for (paused, lang) in [
+            (false, Some(Lang::En)),
+            (false, Some(Lang::Ru)),
+            (false, None),
+            (true, Some(Lang::En)),
+            (true, None),
+        ] {
+            let icon = render_icon_with_theme(paused, lang, THEME);
+            // Off to the side of the centered glyph, still plain fill color.
+            assert_eq!(pixel(&icon, 4, center)[0], 255, "should be inside the disc");
+            assert_eq!(
+                pixel(&icon, 4, center),
+                [255, THEME.muted.0, THEME.muted.1, THEME.muted.2]
+            );
+        }
     }
 
     #[test]
     fn running_draws_a_contrasting_letter() {
         let icon = render_icon_with_theme(false, Some(Lang::Ru), THEME);
-        let text = contrasting_text(THEME.accent);
+        let text = contrasting_text(THEME.muted);
         assert!(
             icon.data
                 .chunks_exact(4)

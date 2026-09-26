@@ -221,12 +221,17 @@ moment after the daemon's own one-shot registration attempt and the icon
 silently never appears for the rest of the session.
 
 The icon's colors come from Omarchy's active theme when one is set - the
-circle is filled with the theme's `accent` color (`muted` while paused),
-read from the same `~/.local/state/omarchy/current/theme/colors.toml`
-Omarchy's own Quickshell shell reads, with the letter drawn in black or
-white depending on which contrasts better against that fill. Outside
-Omarchy (or before a theme is set), it falls back to a plain grey scheme -
-the same fallback values Omarchy's shell itself uses when unthemed.
+circle is filled with the theme's `muted` color (the same in both states;
+paused vs. running is shown by the symbol, not the color), read from the
+same `~/.local/state/omarchy/current/theme/colors.toml` Omarchy's own
+Quickshell shell reads, with the letter drawn in black or white depending
+on which contrasts better against that fill. `accent` is deliberately not
+used: most tray icons are symbolic icons the tray host recolors to its own
+monochrome foreground color, and a raw pixmap icon like this one can't be
+retinted that way, so a theme's (often saturated) accent color would just
+clash with everything next to it. Outside Omarchy (or before a theme is
+set), it falls back to a plain grey scheme - the same fallback values
+Omarchy's shell itself uses when unthemed.
 
 If you don't have a tray host and would rather not set one up, the
 `waybar` subcommand below gives you the same information as a plain bar
@@ -280,6 +285,51 @@ and reference `"custom/linuxautoswitch"` in one of the bar's module lists.
 - Only one daemon instance can hold the control socket (used by
   `status`/`pause`/`resume`/`toggle`/`waybar`) at a time; a second instance
   still runs, but logs a warning and skips starting its own socket.
+
+## Trying a build before merging it
+
+To try a pull request's code on your own machine without touching your
+currently installed, working build:
+
+```sh
+git fetch origin pull/<PR-number>/head:pr-test
+git checkout pr-test
+cargo build --release
+```
+
+(replace `<PR-number>` with the PR's number; if you already have the repo
+cloned with the branch pushed, `git fetch origin <branch-name> && git
+checkout <branch-name>` works just as well).
+
+Then run some fast checks that don't need real hardware:
+
+```sh
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
+
+To actually exercise it interactively, stop the installed service first so
+the two don't fight over the same input devices and D-Bus tray slot, then
+run the freshly built binary in the foreground in a terminal, where its logs
+print directly instead of going to `journalctl`:
+
+```sh
+systemctl --user stop linuxautoswitch
+./target/release/linuxautoswitch
+```
+
+Type a few words in both layouts, try the manual-flip and pause hotkeys, and
+check `Ctrl+C` stops it cleanly. When you're done, either go back to your
+installed build:
+
+```sh
+git checkout main
+systemctl --user start linuxautoswitch
+```
+
+or, if the PR looks good and you want to adopt it as your installed build,
+run `./install.sh` from that branch instead - it rebuilds and restarts the
+service for you.
 
 ## Uninstall
 
