@@ -23,6 +23,9 @@ struct LastWord {
     keys: Vec<TypedKey>,
     /// Which language's text is actually on screen right now for these keys.
     lang_on_screen: Lang,
+    /// Spaces typed after the word, between it and the cursor. A flip has to
+    /// delete and retype them too.
+    trailing_spaces: usize,
 }
 
 /// One bit per physical modifier key, so releasing one side of a pair
@@ -64,12 +67,16 @@ pub struct Engine {
     buffer: Vec<TypedKey>,
     /// Set once the current word runs past `MAX_WORD_KEYS`.
     overflowed: bool,
+    /// The current word was flipped by hand; don't let automatic correction
+    /// flip it back before it's finished.
+    manually_flipped: bool,
     /// Currently held modifier keys, as `LEFT_SHIFT | ...` bits.
     modifiers: u8,
     capslock: bool,
-    current_class: String,
-    /// Cached exclusion check (window class + Steam detection) for
-    /// `current_class`, refreshed only when focus changes rather than on
+    /// Hyprland address of the focused window.
+    current_window: String,
+    /// Cached exclusion check (window class + Steam detection) for the
+    /// focused window, refreshed only when focus changes rather than on
     /// every keystroke.
     excluded: bool,
     /// Toggled by the pause hotkey or a `pause`/`resume`/`toggle` control
@@ -82,10 +89,22 @@ pub struct Engine {
     /// the configured name didn't parse.
     manual_correct_key: Option<KeyCode>,
     manual_correct_window: Duration,
+    /// When the last clean tap of `manual_correct_key` was released.
     manual_correct_last_tap: Option<Instant>,
+    /// `manual_correct_key` is down and nothing else has been pressed since,
+    /// so releasing it counts as a tap. Shift pressed to type a capital
+    /// letter is not a tap.
+    manual_tap_pending: bool,
     /// Modifier bits that must all be held to toggle pause, resolved from
     /// `cfg.hotkeys.toggle_pause_keys`; 0 disables the hotkey.
     toggle_pause_mask: u8,
+    /// Every toggle-pause key is held and nothing else was pressed since
+    /// the first of them went down; the toggle fires on release.
+    toggle_pause_armed: bool,
+    /// Some other key was pressed while a toggle-pause key was held, e.g.
+    /// both Shifts overlapping while typing capitals. Cleared once all of
+    /// them are released.
+    toggle_pause_dirty: bool,
     /// Hyprland keyboard device name -> last known active language.
     device_lang: HashMap<String, Lang>,
     /// The most recently observed active language on any keyboard, used
@@ -112,11 +131,8 @@ impl Engine {
             }
         }
 
-        let (current_class, excluded) = match hypr::get_active_window().ok().flatten() {
-            Some(win) => {
-                let excluded = compute_excluded(&win.class, win.pid, &cfg);
-                (win.class, excluded)
-            }
+        let (current_window, excluded) = match hypr::get_active_window().ok().flatten() {
+            Some(win) => (win.address, compute_excluded(&win.class, win.pid, &cfg)),
             None => (String::new(), false),
         };
 
@@ -137,16 +153,20 @@ impl Engine {
             cfg,
             buffer: Vec::new(),
             overflowed: false,
+            manually_flipped: false,
             modifiers: 0,
             capslock: false,
-            current_class,
+            current_window,
             excluded,
             paused,
             last_word: None,
             manual_correct_key,
             manual_correct_window,
             manual_correct_last_tap: None,
+            manual_tap_pending: false,
             toggle_pause_mask,
+            toggle_pause_armed: false,
+            toggle_pause_dirty: false,
             device_lang: HashMap::new(),
             last_lang: None,
             keyboards: Vec::new(),
@@ -187,26 +207,36 @@ impl Engine {
             Ok(active) => active,
             Err(e) => {
                 tracing::debug!("could not query active window: {e:#}");
+                // Focus did change, we just can't tell where to; don't
+                // carry the word over.
+                self.forget_words();
                 return;
             }
         };
-        let (class, pid) = match active {
-            Some(win) => (win.class, win.pid),
-            None => (String::new(), 0),
+        let (window, class, pid) = match active {
+            Some(win) => (win.address, win.class, win.pid),
+            None => (String::new(), String::new(), 0),
         };
-        if class != self.current_class {
+        // Compare windows, not classes: two windows of the same app share a
+        // class, and a word typed in one must not be retyped into the other.
+        if window != self.current_window {
             self.excluded = compute_excluded(&class, pid, &self.cfg);
-            self.current_class = class;
-            self.reset_word();
-            // A word sitting before the cursor in the app we just left
-            // behind isn't safe to retype into whatever's focused now.
-            self.last_word = None;
+            self.current_window = window;
+            self.forget_words();
         }
+    }
+
+    /// Drops both the word being typed and the last completed one, e.g.
+    /// when focus moves: neither is safe to retype into another window.
+    fn forget_words(&mut self) {
+        self.reset_word();
+        self.last_word = None;
     }
 
     fn reset_word(&mut self) {
         self.buffer.clear();
         self.overflowed = false;
+        self.manually_flipped = false;
     }
 
     fn shift(&self) -> bool {
@@ -237,43 +267,18 @@ impl Engine {
     pub fn handle_key(&mut self, source_device: &str, code: KeyCode, value: i32) {
         let held = value != 0;
 
+        if value == 1 {
+            self.track_hotkey_press(code);
+        }
+
         if let Some(bit) = modifier_bit(code) {
-            let was_held = self.modifiers & bit != 0;
             if held {
                 self.modifiers |= bit;
             } else {
                 self.modifiers &= !bit;
             }
-
-            // Toggle-pause combo: fire once, on the transition into "every
-            // configured key held", not again on every autorepeat while
-            // they're kept down. Works regardless of `paused`/`excluded` -
-            // it has to, since it's the way out of `paused`.
-            if self.toggle_pause_mask != 0
-                && held
-                && !was_held
-                && self.modifiers & self.toggle_pause_mask == self.toggle_pause_mask
-            {
-                self.paused = !self.paused;
-                tracing::info!(paused = self.paused, "toggled pause via hotkey");
-                self.reset_word();
-            }
-
-            // Manual-flip double-tap: only a fresh key-down (not release or
-            // autorepeat) of the configured key counts as a tap.
-            if value == 1 && self.manual_correct_key == Some(code) {
-                let now = Instant::now();
-                let is_double_tap = self
-                    .manual_correct_last_tap
-                    .is_some_and(|t| now.duration_since(t) <= self.manual_correct_window);
-                if is_double_tap {
-                    // Consumed: a third tap starts a fresh pair rather than
-                    // firing again immediately.
-                    self.manual_correct_last_tap = None;
-                    self.manual_flip(source_device);
-                } else {
-                    self.manual_correct_last_tap = Some(now);
-                }
+            if value == 0 {
+                self.track_hotkey_release(code, bit, source_device);
             }
             return;
         }
@@ -289,19 +294,27 @@ impl Engine {
         }
 
         if self.paused || self.excluded {
-            self.reset_word();
+            self.forget_words();
             return;
         }
 
         if code == KeyCode::KEY_BACKSPACE {
-            self.buffer.pop();
+            if self.buffer.pop().is_none() {
+                // Deleting past the current word eats into what follows the
+                // last word: a trailing space, or the word itself.
+                match &mut self.last_word {
+                    Some(word) if word.trailing_spaces > 0 => word.trailing_spaces -= 1,
+                    _ => self.last_word = None,
+                }
+            }
             return;
         }
 
         if self.modifiers & SHORTCUT != 0 {
             // A shortcut (Ctrl+C, Alt+Tab, Super+...), not text. Whatever
-            // was buffered before it is no longer contiguous on screen.
-            self.reset_word();
+            // was buffered before it is no longer contiguous on screen, and
+            // the shortcut may have changed the text (paste, select all).
+            self.forget_words();
             return;
         }
 
@@ -312,6 +325,7 @@ impl Engine {
             if self.buffer.len() >= MAX_WORD_KEYS {
                 self.buffer.clear();
                 self.overflowed = true;
+                self.last_word = None;
                 return;
             }
             self.buffer.push(TypedKey {
@@ -326,7 +340,7 @@ impl Engine {
             // time, since by the time we see Enter the app has already
             // acted on it. This way the word is usually already fixed
             // before that happens.
-            if self.cfg.general.eager_correction {
+            if self.cfg.general.eager_correction && !self.manually_flipped {
                 self.try_correct(source_device, "", self.cfg.general.eager_min_word_length);
             }
             return;
@@ -339,24 +353,97 @@ impl Engine {
         // arrow key the application has already acted on it (sent a
         // message, moved focus, moved the cursor), so retyping past those
         // would be wrong or too late. A space is still safe to redo.
-        if code == KeyCode::KEY_SPACE {
-            self.try_correct(source_device, " ", self.cfg.general.min_word_length);
-        }
-        // If a correction just fired, the buffer is already empty and
-        // already stashed as `last_word` by `try_correct`. Otherwise - the
-        // word was fine, too short to check, or not recognized in either
-        // language - stash it anyway: this is exactly the case the manual
-        // flip hotkey exists for, words the automatic check didn't touch.
-        if !self.buffer.is_empty() && !self.overflowed {
+        let is_space = code == KeyCode::KEY_SPACE;
+        if self.buffer.is_empty() {
+            // Nothing typed since the last word (e.g. eager correction
+            // already fixed it): only a space keeps it flippable.
+            match &mut self.last_word {
+                Some(word) if is_space && !self.overflowed => word.trailing_spaces += 1,
+                _ => self.last_word = None,
+            }
+        } else if !is_space || self.overflowed {
+            self.last_word = None;
+        } else if self.manually_flipped
+            || !self.try_correct(source_device, " ", self.cfg.general.min_word_length)
+        {
+            // Not corrected - the word was fine, too short to check, or not
+            // recognized in either language. Keep it anyway: this is exactly
+            // the case the manual flip hotkey exists for.
             let device_name = self.resolve_hypr_device_name(source_device);
-            if let Some(lang) = self.lang_for_device(device_name.as_deref()) {
-                self.last_word = Some(LastWord {
+            self.last_word = self
+                .lang_for_device(device_name.as_deref())
+                .map(|lang| LastWord {
                     keys: self.buffer.clone(),
                     lang_on_screen: lang,
+                    trailing_spaces: 1,
                 });
-            }
         }
         self.reset_word();
+    }
+
+    /// Hotkeys are clean taps and chords: they only count when no other key
+    /// is pressed in between, so Shift held to type a capital letter never
+    /// triggers anything. Called on every fresh key-down.
+    fn track_hotkey_press(&mut self, code: KeyCode) {
+        if Some(code) == self.manual_correct_key {
+            self.manual_tap_pending = true;
+        } else {
+            self.manual_tap_pending = false;
+            self.manual_correct_last_tap = None;
+        }
+
+        let mask = self.toggle_pause_mask;
+        if mask == 0 {
+            return;
+        }
+        let bit = modifier_bit(code).unwrap_or(0);
+        if bit & mask == 0 {
+            if self.modifiers & mask != 0 {
+                self.toggle_pause_dirty = true;
+                self.toggle_pause_armed = false;
+            }
+            return;
+        }
+        let pressed = self.modifiers | bit;
+        if !self.toggle_pause_dirty && pressed & mask == mask {
+            self.toggle_pause_armed = true;
+        }
+    }
+
+    /// Fires tap and chord hotkeys when their key is released. `bit` has
+    /// already been cleared from `self.modifiers`.
+    fn track_hotkey_release(&mut self, code: KeyCode, bit: u8, source_device: &str) {
+        if Some(code) == self.manual_correct_key && self.manual_tap_pending {
+            self.manual_tap_pending = false;
+            let now = Instant::now();
+            let is_double_tap = self
+                .manual_correct_last_tap
+                .is_some_and(|t| now.duration_since(t) <= self.manual_correct_window);
+            if is_double_tap {
+                // Consumed: a third tap starts a fresh pair rather than
+                // firing again immediately.
+                self.manual_correct_last_tap = None;
+                self.manual_flip(source_device);
+            } else {
+                self.manual_correct_last_tap = Some(now);
+            }
+        }
+
+        let mask = self.toggle_pause_mask;
+        if bit & mask != 0 {
+            // Toggle on the first release of the full chord - once, not
+            // again as the remaining keys come up. Works regardless of
+            // `paused`/`excluded`, since it's the way out of `paused`.
+            if self.toggle_pause_armed && !self.toggle_pause_dirty {
+                self.paused = !self.paused;
+                tracing::info!(paused = self.paused, "toggled pause via hotkey");
+                self.forget_words();
+            }
+            self.toggle_pause_armed = false;
+            if self.modifiers & mask == 0 {
+                self.toggle_pause_dirty = false;
+            }
+        }
     }
 
     /// Checks the current buffer for a wrong-layout word and, if found,
@@ -366,7 +453,10 @@ impl Engine {
     /// still mid-word (the eager path) needs to keep accumulating
     /// otherwise.
     fn try_correct(&mut self, source_device: &str, boundary: &str, min_length: usize) -> bool {
-        if self.overflowed {
+        // Each key yields at most one letter, so a buffer shorter than the
+        // minimum can't qualify. Checked first because eager correction runs
+        // this on every keystroke.
+        if self.overflowed || self.buffer.len() < min_length.max(MIN_CORRECTION_LENGTH) {
             return false;
         }
 
@@ -382,7 +472,8 @@ impl Engine {
         };
 
         let keys_snapshot = self.buffer.clone();
-        let backspaces = self.buffer.len() + boundary.chars().count();
+        let trailing_spaces = boundary.chars().count();
+        let backspaces = self.buffer.len() + trailing_spaces;
         if let Err(e) = typer::correct_word(backspaces, &format!("{corrected}{boundary}")) {
             tracing::warn!("failed to retype corrected word: {e:#}");
             return false;
@@ -397,6 +488,7 @@ impl Engine {
         self.last_word = Some(LastWord {
             keys: keys_snapshot,
             lang_on_screen: other_lang,
+            trailing_spaces,
         });
 
         match device_name {
@@ -477,13 +569,11 @@ impl Engine {
                 return;
             };
             let keys = self.buffer.clone();
-            if let Some(new_lang) = self.flip_and_retype(&keys, current_lang, source_device) {
-                // The physical keys don't change; only note what's now on
-                // screen, in case the word ends right after this.
-                self.last_word = Some(LastWord {
-                    keys,
-                    lang_on_screen: new_lang,
-                });
+            if self
+                .flip_and_retype(&keys, current_lang, 0, source_device)
+                .is_some()
+            {
+                self.manually_flipped = true;
             }
             return;
         }
@@ -491,30 +581,36 @@ impl Engine {
         if let Some(LastWord {
             keys,
             lang_on_screen,
+            trailing_spaces,
         }) = self.last_word.take()
-            && let Some(new_lang) = self.flip_and_retype(&keys, lang_on_screen, source_device)
+            && let Some(new_lang) =
+                self.flip_and_retype(&keys, lang_on_screen, trailing_spaces, source_device)
         {
             // Toggle back and forth on repeated presses, same as Caramba.
             self.last_word = Some(LastWord {
                 keys,
                 lang_on_screen: new_lang,
+                trailing_spaces,
             });
         }
     }
 
-    /// Retypes `keys` (currently shown as `on_screen_lang`) as the other
-    /// language and switches the active layout to match. Returns the new
-    /// on-screen language on success.
+    /// Retypes `keys` (currently shown as `on_screen_lang`, followed by
+    /// `trailing_spaces` spaces) as the other language and switches the
+    /// active layout to match. Returns the new on-screen language on
+    /// success.
     fn flip_and_retype(
         &mut self,
         keys: &[TypedKey],
         on_screen_lang: Lang,
+        trailing_spaces: usize,
         source_device: &str,
     ) -> Option<Lang> {
         let (corrected, target_lang) = flipped(keys, on_screen_lang)?;
         tracing::info!(to = %corrected, ?target_lang, "manually flipping word");
 
-        if let Err(e) = typer::correct_word(keys.len(), &corrected) {
+        let text = corrected + &" ".repeat(trailing_spaces);
+        if let Err(e) = typer::correct_word(keys.len() + trailing_spaces, &text) {
             tracing::warn!("failed to retype flipped word: {e:#}");
             return None;
         }
@@ -978,19 +1074,29 @@ mod tests {
         assert_eq!(flipped(&[], Lang::En), None);
     }
 
+    const UP: i32 = 0;
+
+    fn tap(engine: &mut Engine, code: KeyCode) {
+        engine.handle_key("kbd", code, DOWN);
+        engine.handle_key("kbd", code, UP);
+    }
+
     #[test]
     fn both_shifts_together_toggle_pause() {
         let mut engine = Engine::new(Config::default());
         assert!(!engine.paused);
         engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
-        assert!(!engine.paused, "one shift alone shouldn't toggle pause");
         engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, DOWN);
+        assert!(!engine.paused, "the chord fires on release");
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, UP);
         assert!(engine.paused, "both shifts together should toggle pause");
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, UP);
+        assert!(engine.paused, "releasing the second key must not re-toggle");
 
-        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, 0);
-        engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, 0);
         engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
         engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, UP);
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, UP);
         assert!(!engine.paused, "pressing both again should toggle back off");
     }
 
@@ -999,11 +1105,25 @@ mod tests {
         let mut engine = Engine::new(Config::default());
         engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
         engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, DOWN);
-        assert!(engine.paused);
-        // Autorepeat of an already-held modifier shouldn't be possible in
-        // practice, but even if it arrived, it must not re-toggle.
         engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, REPEAT);
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, UP);
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, UP);
         assert!(engine.paused);
+    }
+
+    #[test]
+    fn overlapping_shifts_while_typing_capitals_do_not_pause() {
+        // Rolling from right Shift ("A") to left Shift ("P") while typing
+        // fast holds both Shifts at once for a moment, with letters in
+        // between. That's typing, not the pause chord.
+        let mut engine = Engine::new(Config::default());
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, DOWN);
+        tap(&mut engine, KeyCode::KEY_A);
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, UP);
+        tap(&mut engine, KeyCode::KEY_P);
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, UP);
+        assert!(!engine.paused);
     }
 
     #[test]
@@ -1014,21 +1134,82 @@ mod tests {
         engine.last_lang = Some(Lang::En);
         assert!(engine.manual_correct_last_tap.is_none());
 
-        // Tap 1: press and release - just a single tap, not a trigger yet.
-        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
+        // Tap 1: a single tap, not a trigger yet.
+        tap(&mut engine, KeyCode::KEY_LEFTSHIFT);
         assert!(engine.manual_correct_last_tap.is_some());
-        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, 0);
 
         // Tap 2, within the window: this is the double-tap. The pair is
         // consumed (reset to None) so a third tap starts fresh rather than
         // firing again immediately.
-        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
+        tap(&mut engine, KeyCode::KEY_LEFTSHIFT);
         assert!(engine.manual_correct_last_tap.is_none());
-        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, 0);
 
         // Tap 3: starts a new pair.
-        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
+        tap(&mut engine, KeyCode::KEY_LEFTSHIFT);
         assert!(engine.manual_correct_last_tap.is_some());
+    }
+
+    #[test]
+    fn shift_used_for_a_capital_is_not_a_tap() {
+        let mut cfg = Config::default();
+        cfg.hotkeys.manual_correct_window_ms = 10_000;
+        let mut engine = Engine::new(cfg);
+        // Shift+H, then Shift+I: two Shift presses, but both typed letters.
+        for letter in [KeyCode::KEY_H, KeyCode::KEY_I] {
+            engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
+            tap(&mut engine, letter);
+            engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, UP);
+            assert!(engine.manual_correct_last_tap.is_none());
+        }
+    }
+
+    #[test]
+    fn a_key_between_taps_breaks_the_double_tap() {
+        let mut cfg = Config::default();
+        cfg.hotkeys.manual_correct_window_ms = 10_000;
+        let mut engine = Engine::new(cfg);
+        tap(&mut engine, KeyCode::KEY_LEFTSHIFT);
+        tap(&mut engine, KeyCode::KEY_A);
+        assert!(engine.manual_correct_last_tap.is_none());
+    }
+
+    #[test]
+    fn last_word_tracks_spaces_typed_after_it() {
+        let mut engine = Engine::new(Config::default());
+        engine.last_lang = Some(Lang::En);
+        // "qxz" is not a word in either language, so it stays as typed.
+        for code in [KeyCode::KEY_Q, KeyCode::KEY_X, KeyCode::KEY_Z] {
+            tap(&mut engine, code);
+        }
+        tap(&mut engine, KeyCode::KEY_SPACE);
+        assert_eq!(engine.last_word.as_ref().unwrap().trailing_spaces, 1);
+        tap(&mut engine, KeyCode::KEY_SPACE);
+        assert_eq!(engine.last_word.as_ref().unwrap().trailing_spaces, 2);
+        tap(&mut engine, KeyCode::KEY_BACKSPACE);
+        tap(&mut engine, KeyCode::KEY_BACKSPACE);
+        assert_eq!(engine.last_word.as_ref().unwrap().trailing_spaces, 0);
+        // One more Backspace deletes into the word itself.
+        tap(&mut engine, KeyCode::KEY_BACKSPACE);
+        assert!(engine.last_word.is_none());
+    }
+
+    #[test]
+    fn last_word_is_dropped_after_enter() {
+        let mut engine = Engine::new(Config::default());
+        engine.last_lang = Some(Lang::En);
+        for code in [KeyCode::KEY_Q, KeyCode::KEY_X, KeyCode::KEY_Z] {
+            tap(&mut engine, code);
+        }
+        tap(&mut engine, KeyCode::KEY_SPACE);
+        assert!(engine.last_word.is_some());
+        tap(&mut engine, KeyCode::KEY_ENTER);
+        assert!(engine.last_word.is_none());
+
+        for code in [KeyCode::KEY_Q, KeyCode::KEY_X, KeyCode::KEY_Z] {
+            tap(&mut engine, code);
+        }
+        tap(&mut engine, KeyCode::KEY_ENTER);
+        assert!(engine.last_word.is_none());
     }
 
     #[test]

@@ -165,11 +165,15 @@ just isn't in either dictionary. Two hotkeys, both reconfigurable in
 - **Double-tap Left Shift** (`hotkeys.manual_correct_key`,
   `hotkeys.manual_correct_window_ms`) - flips the word under the cursor to
   the other language, no dictionary check at all. Works on the word you're
-  still typing, or (if you've already moved on) the last completed one;
-  press it again to flip back, same as Caramba's own manual-fix shortcut.
+  still typing, or the last completed one if you've only typed spaces
+  after it; press it again to flip back, same as Caramba's own manual-fix
+  shortcut. Only clean taps count: Shift held to type a capital letter
+  is ignored.
 - **Left Shift + Right Shift together** (`hotkeys.toggle_pause_keys`) -
-  pauses or resumes the whole daemon. Always works, even while already
-  paused or focused on an excluded window, since it's the way out of both.
+  pauses or resumes the whole daemon, when you let go. Ignored if you
+  type anything while holding them, so overlapping Shifts while typing
+  capitals don't pause it. Always works, even while already paused or
+  focused on an excluded window, since it's the way out of both.
 
 Set `hotkeys.enabled = false` to turn off both, or change either key
 combination to any of: `leftshift`, `rightshift`, `leftctrl`, `rightctrl`,
@@ -223,11 +227,9 @@ and reference `"custom/linuxautoswitch"` in one of the bar's module lists.
   dictionary. Raise `eager_min_word_length`, or turn `eager_correction` off
   to fall back to boundary-only correction, if this happens often enough to
   bother you.
-- The manual-flip hotkey has the same "acting after the fact" caveat as
-  automatic correction: if you've already pressed Enter and moved on (a
-  message sent, a new empty line focused), flipping the "last word"
-  retypes it wherever the cursor happens to be now, not where it actually
-  is on screen.
+- The manual-flip hotkey only reaches back to the last word while the
+  cursor is still right after it (plus any spaces). After Enter, Tab,
+  punctuation, an arrow key or a focus change there's nothing to flip.
 - Only one daemon instance can hold the control socket (used by
   `status`/`pause`/`resume`/`toggle`/`waybar`) at a time; a second instance
   still runs, but logs a warning and skips starting its own socket.
