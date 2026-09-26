@@ -20,8 +20,25 @@ pub struct General {
     /// Window classes (as reported by `hyprctl activewindow`) to never
     /// touch: terminals, password managers, anywhere retyping text is
     /// dangerous or where non-language gibberish (commands, passwords) is
-    /// expected.
+    /// expected. A trailing `*` matches as a prefix, e.g. `"steam_app_*"`.
     pub excluded_classes: Vec<String>,
+    /// Skip Steam games entirely, detected via the `SteamAppId` environment
+    /// variable Steam sets on every game it launches (native or Proton) -
+    /// far more reliable than window classes, which vary per game.
+    pub exclude_steam_games: bool,
+    /// Check for a correction after every keystroke instead of only at
+    /// word boundaries (space/enter/tab/...). Needed for text that's acted
+    /// on without ever hitting a boundary key, e.g. a browser address bar
+    /// where you type a URL and immediately press Enter, or click a
+    /// suggestion. May very occasionally fire a beat early, mid-word, if a
+    /// partial word you're still typing happens to coincidentally spell a
+    /// real word in the other language - see README.
+    pub eager_correction: bool,
+    /// Minimum length for an eager (mid-word) correction. Kept higher than
+    /// `min_word_length` by default since short coincidental matches are
+    /// more likely, and a premature short correction is more disruptive
+    /// than waiting a couple more keystrokes.
+    pub eager_min_word_length: usize,
 }
 
 impl Default for General {
@@ -37,10 +54,15 @@ impl Default for General {
                 "org.keepassxc.KeePassXC",
                 "1Password",
                 "Bitwarden",
+                "steam",
+                "steam_app_*",
             ]
             .into_iter()
             .map(String::from)
             .collect(),
+            exclude_steam_games: true,
+            eager_correction: true,
+            eager_min_word_length: 4,
         }
     }
 }

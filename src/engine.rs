@@ -3,7 +3,7 @@
 
 use crate::config::Config;
 use crate::keymap::{self, Lang};
-use crate::{dictionary, hypr, typer};
+use crate::{dictionary, hypr, steam, typer};
 use evdev::KeyCode;
 use std::collections::HashMap;
 
@@ -57,8 +57,9 @@ pub struct Engine {
     modifiers: u8,
     capslock: bool,
     current_class: String,
-    /// Cached `excluded_classes` check for `current_class`, refreshed only
-    /// when focus changes rather than on every keystroke.
+    /// Cached exclusion check (window class + Steam detection) for
+    /// `current_class`, refreshed only when focus changes rather than on
+    /// every keystroke.
     excluded: bool,
     /// Hyprland keyboard device name -> last known active language.
     device_lang: HashMap<String, Lang>,
@@ -86,11 +87,13 @@ impl Engine {
             }
         }
 
-        let current_class = hypr::get_active_window_class()
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        let excluded = is_excluded(&current_class, &cfg);
+        let (current_class, excluded) = match hypr::get_active_window().ok().flatten() {
+            Some(win) => {
+                let excluded = compute_excluded(&win.class, win.pid, &cfg);
+                (win.class, excluded)
+            }
+            None => (String::new(), false),
+        };
 
         let mut engine = Self {
             cfg,
@@ -131,6 +134,29 @@ impl Engine {
         }
     }
 
+    /// Re-reads the focused window (class + pid) from Hyprland and
+    /// refreshes the cached exclusion check. The `ActiveWindow` event
+    /// carries no payload of its own - unlike the class, the pid we need for
+    /// Steam detection isn't in the event line, so this is how we get it.
+    fn refresh_active_window(&mut self) {
+        let active = match hypr::get_active_window() {
+            Ok(active) => active,
+            Err(e) => {
+                tracing::debug!("could not query active window: {e:#}");
+                return;
+            }
+        };
+        let (class, pid) = match active {
+            Some(win) => (win.class, win.pid),
+            None => (String::new(), 0),
+        };
+        if class != self.current_class {
+            self.excluded = compute_excluded(&class, pid, &self.cfg);
+            self.current_class = class;
+            self.reset_word();
+        }
+    }
+
     fn reset_word(&mut self) {
         self.buffer.clear();
         self.overflowed = false;
@@ -142,13 +168,7 @@ impl Engine {
 
     pub fn handle_hypr(&mut self, ev: hypr::HyprEvent) {
         match ev {
-            hypr::HyprEvent::ActiveWindow { class } => {
-                if class != self.current_class {
-                    self.excluded = is_excluded(&class, &self.cfg);
-                    self.current_class = class;
-                    self.reset_word();
-                }
-            }
+            hypr::HyprEvent::ActiveWindow => self.refresh_active_window(),
             hypr::HyprEvent::ActiveLayout { keyboard, layout } => {
                 if !self.keyboards.iter().any(|kb| kb.name == keyboard) {
                     // A keyboard we haven't seen yet, e.g. just plugged in.
@@ -220,46 +240,63 @@ impl Engine {
                 shift: self.shift(),
                 capslock: self.capslock,
             });
+            // Check after every keystroke, not just at a boundary: text
+            // that's acted on without ever hitting Space - a browser
+            // address bar you press Enter on, a chat message sent with
+            // Enter, a search box - would otherwise never get corrected in
+            // time, since by the time we see Enter the app has already
+            // acted on it. This way the word is usually already fixed
+            // before that happens.
+            if self.cfg.general.eager_correction {
+                self.try_correct(source_device, "", self.cfg.general.eager_min_word_length);
+            }
             return;
         }
 
         // Space, enter, tab, digits, punctuation, arrows, etc. all end the
-        // current word, but only a space is checked for a correction. By the
-        // time we see the key the application has already acted on it, so
-        // fixing the word means deleting and retyping that key too. That is
-        // safe for a space; Enter may already have sent a message, Tab moved
-        // focus and arrows moved the cursor away from the word.
+        // current word, but only a space is checked for a correction here.
+        // Eager correction above already handles anything that completed a
+        // real word before this point; by the time we see Enter, Tab, or an
+        // arrow key the application has already acted on it (sent a
+        // message, moved focus, moved the cursor), so retyping past those
+        // would be wrong or too late. A space is still safe to redo.
         if code == KeyCode::KEY_SPACE {
-            self.finalize(source_device, " ");
+            self.try_correct(source_device, " ", self.cfg.general.min_word_length);
         }
         self.reset_word();
     }
 
-    /// `boundary` is the text the word-ending key has already put on screen
-    /// after the word; it is deleted and retyped along with the correction.
-    fn finalize(&mut self, source_device: &str, boundary: &str) {
+    /// Checks the current buffer for a wrong-layout word and, if found,
+    /// retypes it - plus `boundary`, text a word-ending key may have
+    /// already put on screen - and switches the layout. Returns whether a
+    /// correction was made; only then is the buffer cleared, since a caller
+    /// still mid-word (the eager path) needs to keep accumulating
+    /// otherwise.
+    fn try_correct(&mut self, source_device: &str, boundary: &str, min_length: usize) -> bool {
         if self.overflowed {
-            return;
+            return false;
         }
-        let keys = std::mem::take(&mut self.buffer);
 
         let device_name = self.resolve_hypr_device_name(source_device);
         let Some(current_lang) = self.lang_for_device(device_name.as_deref()) else {
             tracing::debug!("no known active layout yet, skipping correction check");
-            return;
+            return false;
         };
 
         let other_lang = current_lang.other();
-        let Some(corrected) = correction(&keys, current_lang, self.cfg.general.min_word_length)
-        else {
-            return;
+        let Some(corrected) = correction(&self.buffer, current_lang, min_length) else {
+            return false;
         };
 
-        let backspaces = keys.len() + boundary.chars().count();
+        let backspaces = self.buffer.len() + boundary.chars().count();
         if let Err(e) = typer::correct_word(backspaces, &format!("{corrected}{boundary}")) {
             tracing::warn!("failed to retype corrected word: {e:#}");
-            return;
+            return false;
         }
+        // Whatever was typed is gone now regardless of whether the layout
+        // switch below succeeds - don't let a stale buffer trigger another
+        // correction on top of this one.
+        self.reset_word();
 
         match device_name {
             Some(device_name) => {
@@ -280,6 +317,7 @@ impl Engine {
                  set `hypr.device_name_override` in the config"
             ),
         }
+        true
     }
 
     fn lang_for_device(&self, device_name: Option<&str>) -> Option<Lang> {
@@ -374,13 +412,18 @@ fn trim_trailing_punctuation(word: &str) -> &str {
 }
 
 /// `cfg.general.excluded_classes` must already be lowercased (see
-/// `Engine::new`).
-fn is_excluded(class: &str, cfg: &Config) -> bool {
-    if class.is_empty() {
-        return false;
+/// `Engine::new`). A trailing `*` in a pattern matches as a prefix.
+fn compute_excluded(class: &str, pid: i32, cfg: &Config) -> bool {
+    let class_excluded = !class.is_empty()
+        && cfg
+            .general
+            .excluded_classes
+            .iter()
+            .any(|pattern| steam::class_matches(class, pattern));
+    if class_excluded {
+        return true;
     }
-    let class = class.to_lowercase();
-    cfg.general.excluded_classes.contains(&class)
+    cfg.general.exclude_steam_games && steam::is_steam_process(pid)
 }
 
 /// The `cfg.layouts` matchers must already be lowercased (see
@@ -485,6 +528,27 @@ mod tests {
             KeyCode::KEY_COMMA,
         ];
         assert_eq!(correction(&keys(&codes), Lang::En, 3), None);
+    }
+
+    #[test]
+    fn google_typed_under_wrong_layout_is_corrected() {
+        // g o o g l e physically pressed while a Russian layout is active
+        // produces gibberish on screen, but should still resolve to the
+        // English brand name - this is the case eager, per-keystroke
+        // checking exists for: by the time Enter is pressed in a browser's
+        // address bar, the word is already complete and this fires.
+        let codes = [
+            KeyCode::KEY_G,
+            KeyCode::KEY_O,
+            KeyCode::KEY_O,
+            KeyCode::KEY_G,
+            KeyCode::KEY_L,
+            KeyCode::KEY_E,
+        ];
+        assert_eq!(
+            correction(&keys(&codes), Lang::Ru, 3).as_deref(),
+            Some("google")
+        );
     }
 
     #[test]

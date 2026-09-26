@@ -68,14 +68,30 @@ pub fn get_keyboards() -> Result<Vec<KeyboardDevice>> {
     Ok(parsed.keyboards)
 }
 
-pub fn get_active_window_class() -> Result<Option<String>> {
+#[derive(Debug, Clone)]
+pub struct ActiveWindow {
+    pub class: String,
+    /// PID of the process owning the focused window, used to walk up the
+    /// process tree and recognize Steam games (see `crate::steam`).
+    pub pid: i32,
+}
+
+pub fn get_active_window() -> Result<Option<ActiveWindow>> {
     let resp = send_command("j/activewindow")?;
     if resp.trim().is_empty() || resp.trim() == "{}" {
         return Ok(None);
     }
     let v: serde_json::Value =
         serde_json::from_str(&resp).context("parsing `hyprctl j/activewindow` output")?;
-    Ok(v.get("class").and_then(|c| c.as_str()).map(String::from))
+    let class = v.get("class").and_then(|c| c.as_str()).map(String::from);
+    let pid = v.get("pid").and_then(|p| p.as_i64());
+    Ok(match (class, pid) {
+        (Some(class), Some(pid)) => Some(ActiveWindow {
+            class,
+            pid: pid as i32,
+        }),
+        _ => None,
+    })
 }
 
 /// Switches `device` to the layout at `index` in its configured
@@ -91,8 +107,14 @@ pub fn switch_layout(device: &str, index: u32) -> Result<()> {
 
 #[derive(Debug, Clone)]
 pub enum HyprEvent {
-    ActiveWindow { class: String },
-    ActiveLayout { keyboard: String, layout: String },
+    /// Focus changed. Carries no payload: the event line itself doesn't
+    /// include the pid we need for Steam detection, so on receipt we just
+    /// re-query `j/activewindow` for the full picture.
+    ActiveWindow,
+    ActiveLayout {
+        keyboard: String,
+        layout: String,
+    },
 }
 
 /// Spawns a background thread that connects to Hyprland's event socket and
@@ -118,11 +140,8 @@ fn connect_and_listen<T: From<HyprEvent>>(tx: &Sender<T>) -> Result<()> {
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         let line = line?;
-        if let Some(rest) = line.strip_prefix("activewindow>>") {
-            // payload is "CLASS,TITLE" - title itself may contain commas, so
-            // only split off the first field.
-            let class = rest.split(',').next().unwrap_or("").to_string();
-            if tx.send(HyprEvent::ActiveWindow { class }.into()).is_err() {
+        if line.strip_prefix("activewindow>>").is_some() {
+            if tx.send(HyprEvent::ActiveWindow.into()).is_err() {
                 return Ok(());
             }
         } else if let Some(rest) = line.strip_prefix("activelayout>>") {

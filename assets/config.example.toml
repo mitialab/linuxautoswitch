@@ -16,6 +16,7 @@ min_word_length = 3
 # touched: terminals, password managers, anywhere retyping text would be
 # dangerous or where non-language text (commands, passwords) is normal.
 # Run `hyprctl activewindow` while focused on an app to find its class.
+# A trailing `*` matches as a prefix, e.g. "steam_app_*".
 excluded_classes = [
   "kitty",
   "foot",
@@ -24,7 +25,26 @@ excluded_classes = [
   "org.keepassxc.KeePassXC",
   "1Password",
   "Bitwarden",
+  "steam",
+  "steam_app_*",
 ]
+
+# Skip Steam games entirely. Detected via the `SteamAppId` environment
+# variable Steam sets on every game it launches (native or Proton), so this
+# works without needing to list every game's window class individually.
+exclude_steam_games = true
+
+# Check for a correction after every keystroke instead of only at word
+# boundaries (space/enter/tab/...). Needed for e.g. a browser address bar,
+# where you type a URL and press Enter immediately rather than a space.
+# Can very occasionally fire a beat early on a partial word that
+# coincidentally spells a real word in the other language - see the
+# README's "Known limitations" section.
+eager_correction = true
+
+# Minimum length for an eager (mid-word) correction. Kept higher than
+# min_word_length above since short coincidental matches are more likely.
+eager_min_word_length = 4
 
 [layouts]
 # Substrings (case-insensitive) matched against Hyprland's `active_keymap`

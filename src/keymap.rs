@@ -165,6 +165,32 @@ mod tests {
     }
 
     #[test]
+    fn google_typed_under_wrong_layout_reconstructs_correctly() {
+        // Same idea as "privet", the other direction: physically typing
+        // "google" while a Russian layout is active produces gibberish on
+        // screen, but the underlying keys still reconstruct as "google"
+        // under the English mapping.
+        let keys = [
+            KeyCode::KEY_G,
+            KeyCode::KEY_O,
+            KeyCode::KEY_O,
+            KeyCode::KEY_G,
+            KeyCode::KEY_L,
+            KeyCode::KEY_E,
+        ];
+        let en: String = keys
+            .iter()
+            .map(|&k| char_for(k, false, false, Lang::En).unwrap())
+            .collect();
+        let ru: String = keys
+            .iter()
+            .map(|&k| char_for(k, false, false, Lang::Ru).unwrap())
+            .collect();
+        assert_eq!(en, "google");
+        assert_eq!(ru, "пщщпду");
+    }
+
+    #[test]
     fn capslock_only_shifts_az_in_english() {
         assert_eq!(
             char_for(KeyCode::KEY_SEMICOLON, false, true, Lang::En),

@@ -54,6 +54,15 @@ mod tests {
     }
 
     #[test]
+    fn brand_and_site_names_are_recognized() {
+        assert!(contains(Lang::En, "google"));
+        assert!(contains(Lang::En, "youtube"));
+        assert!(contains(Lang::En, "github"));
+        assert!(contains(Lang::Ru, "яндекс"));
+        assert!(contains(Lang::Ru, "вконтакте"));
+    }
+
+    #[test]
     fn unknown_words() {
         assert!(!contains(Lang::En, "ghbdtn"));
         assert!(!contains(Lang::Ru, "руддщ"));
