@@ -70,6 +70,9 @@ pub fn get_keyboards() -> Result<Vec<KeyboardDevice>> {
 
 #[derive(Debug, Clone)]
 pub struct ActiveWindow {
+    /// Hyprland's unique window address; tells apart two windows of the
+    /// same app, which share a class (and often a pid).
+    pub address: String,
     pub class: String,
     /// PID of the process owning the focused window, used to walk up the
     /// process tree and recognize Steam games (see `crate::steam`).
@@ -85,8 +88,10 @@ pub fn get_active_window() -> Result<Option<ActiveWindow>> {
         serde_json::from_str(&resp).context("parsing `hyprctl j/activewindow` output")?;
     let class = v.get("class").and_then(|c| c.as_str()).map(String::from);
     let pid = v.get("pid").and_then(|p| p.as_i64());
+    let address = v.get("address").and_then(|a| a.as_str()).unwrap_or("");
     Ok(match (class, pid) {
         (Some(class), Some(pid)) => Some(ActiveWindow {
+            address: address.to_string(),
             class,
             pid: pid as i32,
         }),

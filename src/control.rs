@@ -9,6 +9,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
@@ -85,6 +86,10 @@ pub fn serve<T: From<ControlEvent> + Send + 'static>(tx: Sender<T>) -> Result<()
     }
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("binding control socket at {}", path.display()))?;
+    // Owner only: without XDG_RUNTIME_DIR the socket lands in the shared
+    // /tmp, where any local user could otherwise pause the daemon.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("restricting permissions on {}", path.display()))?;
     tracing::info!(path = %path.display(), "control socket listening");
 
     thread::spawn(move || {
@@ -102,6 +107,9 @@ pub fn serve<T: From<ControlEvent> + Send + 'static>(tx: Sender<T>) -> Result<()
 }
 
 fn handle_connection<T: From<ControlEvent>>(mut stream: UnixStream, tx: &Sender<T>) -> Result<()> {
+    // A client that connects and never sends a line shouldn't hold this
+    // thread open forever.
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     reader.read_line(&mut line)?;
