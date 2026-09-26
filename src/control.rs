@@ -41,7 +41,7 @@ impl ControlRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ControlResponse {
     pub paused: bool,
     /// The most recently observed active layout, "en" or "ru" - `None` if

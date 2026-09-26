@@ -101,8 +101,9 @@ SOFTWARE.
 ## Rust crate dependencies
 
 Everything in `Cargo.toml` (`evdev`, `fst`, `clap`, `serde`, `serde_json`,
-`toml`, `tracing`, `tracing-subscriber`, `tracing-journald`, `anyhow`) is
-used as an unmodified upstream dependency under its own license (MIT and/or
-Apache-2.0 for all of them, per their published `Cargo.toml` metadata) - run
-`cargo license` (`cargo install cargo-license`) for the exact, current list
+`toml`, `tracing`, `tracing-subscriber`, `tracing-journald`, `anyhow`,
+`ksni` [Unlicense] and its `zbus` D-Bus dependency [MIT/Apache-2.0]) is used
+as an unmodified upstream dependency under its own license (MIT and/or
+Apache-2.0 for all but `ksni`, per their published `Cargo.toml` metadata) -
+run `cargo license` (`cargo install cargo-license`) for the exact, current list
 if you need it.

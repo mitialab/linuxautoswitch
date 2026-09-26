@@ -179,7 +179,9 @@ Set `hotkeys.enabled = false` to turn off both, or change either key
 combination to any of: `leftshift`, `rightshift`, `leftctrl`, `rightctrl`,
 `leftalt`, `rightalt`, `leftmeta`/`leftsuper`, `rightmeta`/`rightsuper`.
 
-## Checking status from your shell
+## Checking status: shell, tray icon, or status bar
+
+### Shell
 
 The running daemon exposes its state over a small control socket, and the
 same binary talks to it as a client when run with a subcommand:
@@ -192,9 +194,29 @@ linuxautoswitch resume
 linuxautoswitch toggle
 ```
 
-For a status-bar indicator (Omarchy's default bar is
-[Waybar](https://github.com/Alexays/Waybar)) showing the current layout as
-text - "EN"/"RU", or "⏸ EN" while paused - add a custom module:
+### System tray icon
+
+The daemon also shows a real tray icon - a small colored square with "EN"
+or "RU" on it (gray with a pause symbol while paused) - via the
+[StatusNotifierItem](https://www.freedesktop.org/wiki/Specifications/StatusNotifierItem/StatusNotifierItem/)
+D-Bus protocol, the same one any other tray application (a network applet,
+a chat client) uses. It appears automatically, with no config needed,
+*if* something on your system hosts a tray: Waybar's own `"tray"` module,
+KDE Plasma natively, or GNOME with an
+[AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/)
+(GNOME doesn't implement a tray on its own). If nothing hosts a tray yet
+when the daemon starts, it keeps retrying in the background rather than
+giving up, so it'll appear once one does. Right-click it for Pause/Resume
+and Quit.
+
+If you don't have a tray host and would rather not set one up, the
+`waybar` subcommand below gives you the same information as a plain bar
+module instead.
+
+### Waybar custom module
+
+For a status-bar indicator with no tray host involved - the current layout
+as text, "EN"/"RU", or "⏸ EN" while paused - add a custom module:
 
 ```jsonc
 // ~/.config/waybar/config
@@ -212,6 +234,12 @@ and reference `"custom/linuxautoswitch"` in one of the bar's module lists.
 - Only two layouts (English/Russian) are supported for now.
 - Hyphenated words, apostrophe-contractions and anything with digits inside
   a "word" aren't corrected - those keys are treated as word boundaries.
+- The tray icon needs something on your system hosting a
+  StatusNotifierItem tray: Waybar's own `"tray"` module or KDE Plasma work
+  out of the box, but GNOME needs an
+  [AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/)
+  installed first. No tray host at all just means no icon; everything else
+  (correction, hotkeys, `linuxautoswitch status`) still works.
 - Multi-keyboard setups may need `hypr.device_name_override` set manually if
   auto-detection guesses the wrong device.
 - No per-application layout memory (Caramba's other headline feature) - this
@@ -264,7 +292,8 @@ This project wouldn't work, or exist, without:
   detection and switching.
 - **Rust crates**: [`evdev`](https://crates.io/crates/evdev) for raw
   keyboard input, [`fst`](https://crates.io/crates/fst) (BurntSushi) for the
-  compact embedded dictionaries, plus `clap`, `serde`, `toml`, `tracing`,
+  compact embedded dictionaries, [`ksni`](https://crates.io/crates/ksni) for
+  the StatusNotifierItem tray icon, plus `clap`, `serde`, `toml`, `tracing`,
   and `anyhow`.
 
 ## License

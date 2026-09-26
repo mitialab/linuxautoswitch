@@ -5,6 +5,7 @@ mod engine;
 mod hypr;
 mod keymap;
 mod steam;
+mod tray;
 mod typer;
 
 use clap::{Parser, Subcommand};
@@ -62,6 +63,7 @@ enum Event {
     /// A new keyboard device was plugged in.
     KeyboardsChanged,
     Control(control::ControlEvent),
+    Tray(tray::TrayAction),
 }
 
 impl From<hypr::HyprEvent> for Event {
@@ -73,6 +75,12 @@ impl From<hypr::HyprEvent> for Event {
 impl From<control::ControlEvent> for Event {
     fn from(ev: control::ControlEvent) -> Self {
         Event::Control(ev)
+    }
+}
+
+impl From<tray::TrayAction> for Event {
+    fn from(action: tray::TrayAction) -> Self {
+        Event::Tray(action)
     }
 }
 
@@ -277,6 +285,11 @@ fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         tracing::warn!("control socket not available: {e:#}");
     }
 
+    // Real system-tray icon (StatusNotifierItem, via ksni), separate from
+    // the `waybar` subcommand's text-only module. Also not fatal if no SNI
+    // host is around at all (e.g. no D-Bus session).
+    let tray_handle = tray::spawn(tx.clone());
+
     // One reader thread per physical keyboard device, including ones
     // plugged in later.
     let seen: Seen = Arc::default();
@@ -295,6 +308,7 @@ fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     });
 
     let mut engine = engine::Engine::new(cfg);
+    let mut last_tray_status: Option<control::ControlResponse> = None;
     for event in rx {
         match event {
             Event::Key {
@@ -307,6 +321,33 @@ fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             Event::Control(ev) => {
                 let response = engine.handle_control(ev.request);
                 let _ = ev.reply.send(response);
+            }
+            Event::Tray(tray::TrayAction::TogglePause) => {
+                engine.handle_control(control::ControlRequest::Toggle);
+            }
+            Event::Tray(tray::TrayAction::Quit) => {
+                tracing::info!("quit requested from tray menu");
+                break;
+            }
+        }
+
+        // Cheap to compute (no I/O); only push to the tray - which crosses
+        // threads and emits D-Bus signals - when something visible actually
+        // changed, rather than on every keystroke.
+        if let Some(handle) = &tray_handle {
+            let status = engine.handle_control(control::ControlRequest::Status);
+            if last_tray_status.as_ref() != Some(&status) {
+                let lang = status.lang.as_deref().and_then(|s| match s {
+                    "en" => Some(keymap::Lang::En),
+                    "ru" => Some(keymap::Lang::Ru),
+                    _ => None,
+                });
+                let paused = status.paused;
+                handle.update(|tray| {
+                    tray.paused = paused;
+                    tray.lang = lang;
+                });
+                last_tray_status = Some(status);
             }
         }
     }
