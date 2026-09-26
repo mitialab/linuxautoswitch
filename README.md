@@ -2,6 +2,16 @@
 
 **Language:** English | [Русский](README.ru.md)
 
+> **🤖 This project is vibecoded.** Essentially all of the code, the design
+> decisions, the tests, and this README were written by
+> [Claude](https://claude.ai) (Anthropic's AI, via Claude Code) from
+> natural-language prompts - not typed by hand. The repository owner
+> directed it at a high level and reviewed the results, but did not author
+> the implementation line by line. This daemon reads every raw keystroke
+> from your keyboard and injects synthetic key events back into your
+> session - please actually read the code yourself (it's not that long)
+> before you trust it with that, rather than taking a README's word for it.
+
 Automatic EN/RU keyboard layout correction for [Omarchy](https://omarchy.org)
 (Hyprland). Inspired by [Caramba Switcher](https://caramba.io) and the
 classic Windows tool Punto Switcher: type a word in the wrong layout -
@@ -170,8 +180,11 @@ systemctl --user daemon-reload
 
 ## Credits
 
-This project wouldn't work without:
+This project wouldn't work, or exist, without:
 
+- **[Claude](https://claude.ai) / Claude Code (Anthropic)** - wrote the code,
+  the tests, and this documentation. See the disclosure at the top of this
+  file.
 - **Concept**: [Caramba Switcher](https://caramba.io) (macOS/Windows) and
   the original Punto Switcher, whose "type it wrong, get it fixed
   automatically" approach this project ports to Linux/Hyprland.
@@ -189,3 +202,10 @@ This project wouldn't work without:
   keyboard input, [`fst`](https://crates.io/crates/fst) (BurntSushi) for the
   compact embedded dictionaries, plus `clap`, `serde`, `toml`, `tracing`,
   and `anyhow`.
+
+## License
+
+linuxautoswitch's own code is [MIT-licensed](LICENSE). The two embedded
+dictionaries and `wtype` carry their own licenses (also MIT, plus the
+Unlicense for the English word list) - see
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for the full texts.
