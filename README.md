@@ -95,6 +95,13 @@ Key settings:
   via the `SteamAppId` env var rather than window class)
 - `general.eager_correction` - correct mid-word, on every keystroke, instead
   of waiting for space/enter (on by default; see limitations below)
+- `general.min_word_length` / `general.eager_min_word_length` - two separate
+  thresholds on purpose: a word confirmed complete by pressing Space can be
+  trusted even if short (`min_word_length`, default 2 - catches "да", "но"),
+  while a still-growing buffer checked mid-word needs a higher bar
+  (`eager_min_word_length`, default 4) since a short one might just be the
+  first letters of something longer. Single-letter words are never
+  corrected, regardless of either setting.
 - `layouts.english_index` / `russian_index` - must match the order of
   `kb_layout` in your Hyprland config (e.g. `kb_layout = us,ru` means
   `english_index = 0`, `russian_index = 1`)

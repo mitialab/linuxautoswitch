@@ -7,10 +7,14 @@
 [general]
 enabled = true
 
-# Words shorter than this are never auto-corrected - short strings are too
-# likely to produce a spurious dictionary match in one language or the
-# other.
-min_word_length = 3
+# Minimum length for a correction triggered by pressing Space after a word.
+# Kept lower than eager_min_word_length below on purpose: by the time Space
+# is pressed the word is confirmed complete (nothing more is coming), so a
+# short word like "да" or "но" can be trusted the same as a long one.
+# 1-letter words are never corrected no matter what this is set to - too
+# easy to get a spurious hit, and too disruptive when it's a real
+# single-letter word, an initial, or an abbreviation.
+min_word_length = 2
 
 # Window classes (as reported by `hyprctl activewindow`) that are never
 # touched: terminals, password managers, anywhere retyping text would be
@@ -43,7 +47,9 @@ exclude_steam_games = true
 eager_correction = true
 
 # Minimum length for an eager (mid-word) correction. Kept higher than
-# min_word_length above since short coincidental matches are more likely.
+# min_word_length above since, unlike a completed word at Space, a short
+# buffer here might just be the first letters of a longer word still being
+# typed - not enough to trust yet.
 eager_min_word_length = 4
 
 [layouts]

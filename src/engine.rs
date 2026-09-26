@@ -361,9 +361,16 @@ impl Engine {
     }
 }
 
+/// Corrections never fire below this length, regardless of config: a single
+/// letter is too likely to be a real initial, a loop variable, or list
+/// marker, and matching it against either dictionary is close to a coin
+/// flip.
+const MIN_CORRECTION_LENGTH: usize = 2;
+
 /// The text `keys` should be replaced with if they were typed in the wrong
 /// layout (`current_lang` being the active one), or `None` to leave them.
 fn correction(keys: &[TypedKey], current_lang: Lang, min_word_length: usize) -> Option<String> {
+    let min_word_length = min_word_length.max(MIN_CORRECTION_LENGTH);
     let en_word: String = keys
         .iter()
         .filter_map(|k| keymap::char_for(k.code, k.shift, k.capslock, Lang::En))
@@ -549,6 +556,35 @@ mod tests {
             correction(&keys(&codes), Lang::Ru, 3).as_deref(),
             Some("google")
         );
+    }
+
+    #[test]
+    fn short_word_is_corrected_when_confirmed_complete() {
+        // KEY_J -> "о", KEY_Y -> "н": physically typing "он" ("he") while
+        // English is active produces the meaningless "jy" on screen. At a
+        // word boundary (Space was just pressed) the word is known to be
+        // complete, so even a 2-letter word like this can be trusted.
+        let codes = [KeyCode::KEY_J, KeyCode::KEY_Y];
+        assert_eq!(
+            correction(&keys(&codes), Lang::En, 2).as_deref(),
+            Some("он")
+        );
+    }
+
+    #[test]
+    fn short_word_is_not_corrected_eagerly() {
+        // The same two letters, but checked with the (higher) eager
+        // mid-word threshold: at only two letters in, there's no telling a
+        // complete short word from the first two letters of a longer one,
+        // so eager checking should hold off.
+        let codes = [KeyCode::KEY_J, KeyCode::KEY_Y];
+        assert_eq!(correction(&keys(&codes), Lang::En, 4), None);
+    }
+
+    #[test]
+    fn single_letter_is_never_corrected_even_if_configured_to() {
+        let codes = [KeyCode::KEY_J];
+        assert_eq!(correction(&keys(&codes), Lang::En, 1), None);
     }
 
     #[test]
