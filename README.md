@@ -196,8 +196,9 @@ linuxautoswitch toggle
 
 ### System tray icon
 
-The daemon also shows a real tray icon - a small colored square with "EN"
-or "RU" on it (gray with a pause symbol while paused) - via the
+The daemon also shows a real tray icon - a circle with a single letter,
+"E" for English or "Р" for Russian (a pause symbol instead while paused) -
+via the
 [StatusNotifierItem](https://www.freedesktop.org/wiki/Specifications/StatusNotifierItem/StatusNotifierItem/)
 D-Bus protocol, the same one any other tray application (a network applet,
 a chat client) uses. It appears automatically, with no config needed, on
@@ -218,6 +219,14 @@ waits up to 30 seconds at startup for a tray host to actually appear
 before giving up, rather than risking a race where the host shows up a
 moment after the daemon's own one-shot registration attempt and the icon
 silently never appears for the rest of the session.
+
+The icon's colors come from Omarchy's active theme when one is set - the
+circle is filled with the theme's `accent` color (`muted` while paused),
+read from the same `~/.local/state/omarchy/current/theme/colors.toml`
+Omarchy's own Quickshell shell reads, with the letter drawn in black or
+white depending on which contrasts better against that fill. Outside
+Omarchy (or before a theme is set), it falls back to a plain grey scheme -
+the same fallback values Omarchy's shell itself uses when unthemed.
 
 If you don't have a tray host and would rather not set one up, the
 `waybar` subcommand below gives you the same information as a plain bar
