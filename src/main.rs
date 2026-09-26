@@ -333,8 +333,13 @@ fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
 
         // Cheap to compute (no I/O); only push to the tray - which crosses
         // threads and emits D-Bus signals - when something visible actually
-        // changed, rather than on every keystroke.
-        if let Some(handle) = &tray_handle {
+        // changed, rather than on every keystroke. The tray spawns in the
+        // background (see tray::spawn) and may not be in the slot yet.
+        if let Some(handle) = tray_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             let status = engine.handle_control(control::ControlRequest::Status);
             if last_tray_status.as_ref() != Some(&status) {
                 let lang = status.lang.as_deref().and_then(|s| match s {

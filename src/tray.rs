@@ -16,6 +16,9 @@ use ksni::Icon;
 use ksni::blocking::TrayMethods;
 use ksni::menu::StandardItem;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// An action requested by clicking a tray menu item. Generic `From`/`Into`
 /// (mirroring `hypr::listen` and `control::serve`) so this module doesn't
@@ -74,26 +77,83 @@ impl<T: From<TrayAction> + Send + 'static> ksni::Tray for TrayIcon<T> {
     }
 }
 
-/// Spawns the tray icon in the background and returns a handle used to push
-/// state updates to it. `None` (with a logged warning, non-fatal) if
-/// spawning fails outright - e.g. no D-Bus session bus at all. A missing
-/// tray *host* specifically (no bar has a tray module yet) is treated as a
-/// soft error internally and retried, so the icon can still appear later if
-/// one starts.
+/// How long to wait, at startup, for a StatusNotifierWatcher (a tray host)
+/// to appear on the session bus before giving up and spawning anyway.
+const WATCHER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const WATCHER_POLL_INTERVAL: Duration = Duration::from_millis(300);
+
+/// Spawns the tray icon on a background thread and returns a handle to it
+/// once ready, delivered through a shared slot rather than directly, since
+/// getting it right can take a moment (see below) and the caller shouldn't
+/// block its own startup waiting for it.
+///
+/// `ksni`'s own fallback for "no tray host yet" (`assume_sni_available`)
+/// tries an immediate registration, and only falls back to waiting for the
+/// watcher's `NameOwnerChanged` signal if that first attempt fails - but it
+/// only starts listening for that signal *after* the failed attempt, so a
+/// watcher that appears in the narrow window between the two is missed
+/// entirely, silently, with no icon ever appearing for the rest of the
+/// session. This matters in practice: Quickshell (Omarchy's shell) is a
+/// single process that instantiates its StatusNotifierWatcher lazily, when
+/// its own tray widget loads as part of the wider shell/bar startup, which
+/// can plausibly take longer than this daemon's own near-instant systemd
+/// unit start - i.e. this isn't a rare edge case here, it can lose every
+/// time. Waiting here for the watcher to actually exist before ever calling
+/// `spawn()` sidesteps that race instead of depending on it.
 pub fn spawn<T: From<TrayAction> + Send + 'static>(
     tx: Sender<T>,
-) -> Option<ksni::blocking::Handle<TrayIcon<T>>> {
-    let tray = TrayIcon {
-        paused: false,
-        lang: None,
-        tx,
-    };
-    match tray.assume_sni_available(true).spawn() {
-        Ok(handle) => Some(handle),
-        Err(e) => {
-            tracing::warn!("tray icon not available: {e}");
-            None
+) -> Arc<Mutex<Option<ksni::blocking::Handle<TrayIcon<T>>>>> {
+    let slot = Arc::new(Mutex::new(None));
+    let result_slot = slot.clone();
+    thread::spawn(move || {
+        if !wait_for_watcher(WATCHER_WAIT_TIMEOUT) {
+            tracing::warn!(
+                "no StatusNotifierWatcher (tray host) appeared within {}s; \
+                 spawning anyway, but the tray icon may never show up this session",
+                WATCHER_WAIT_TIMEOUT.as_secs()
+            );
         }
+        let tray = TrayIcon {
+            paused: false,
+            lang: None,
+            tx,
+        };
+        match tray.assume_sni_available(true).spawn() {
+            Ok(handle) => *result_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle),
+            Err(e) => tracing::warn!("tray icon not available: {e}"),
+        }
+    });
+    slot
+}
+
+/// Polls for `org.kde.StatusNotifierWatcher` having an owner on the session
+/// bus, up to `timeout`. Returns `false` on timeout or if a session bus
+/// can't be reached at all (in which case `spawn()`'s own attempt will fail
+/// too, with its own warning).
+fn wait_for_watcher(timeout: Duration) -> bool {
+    let Ok(conn) = zbus::blocking::Connection::session() else {
+        return false;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        let has_owner = conn
+            .call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "NameHasOwner",
+                &("org.kde.StatusNotifierWatcher",),
+            )
+            .ok()
+            .and_then(|reply| reply.body().deserialize::<bool>().ok())
+            .unwrap_or(false);
+        if has_owner {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(WATCHER_POLL_INTERVAL);
     }
 }
 

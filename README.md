@@ -200,14 +200,24 @@ The daemon also shows a real tray icon - a small colored square with "EN"
 or "RU" on it (gray with a pause symbol while paused) - via the
 [StatusNotifierItem](https://www.freedesktop.org/wiki/Specifications/StatusNotifierItem/StatusNotifierItem/)
 D-Bus protocol, the same one any other tray application (a network applet,
-a chat client) uses. It appears automatically, with no config needed,
-*if* something on your system hosts a tray: Waybar's own `"tray"` module,
-KDE Plasma natively, or GNOME with an
+a chat client) uses. It appears automatically, with no config needed, on
+any host that implements that protocol: Waybar's own `"tray"` module, KDE
+Plasma natively, GNOME with an
 [AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/)
-(GNOME doesn't implement a tray on its own). If nothing hosts a tray yet
-when the daemon starts, it keeps retrying in the background rather than
-giving up, so it'll appear once one does. Right-click it for Pause/Resume
-and Quit.
+(GNOME doesn't implement a tray on its own), or
+**[Quickshell](https://quickshell.org)** - Omarchy's own shell, where the
+tray ships as a bar widget (`omarchy.tray`) enabled by default in
+`~/.config/omarchy/shell.json`. Right-click the icon for Pause/Resume and
+Quit.
+
+If the tray host on your system starts more slowly than this daemon does -
+Quickshell in particular is a single process that only creates its tray
+watcher once its own bar/widget startup gets to it, which can plausibly
+take longer than this daemon's near-instant systemd start - the daemon
+waits up to 30 seconds at startup for a tray host to actually appear
+before giving up, rather than risking a race where the host shows up a
+moment after the daemon's own one-shot registration attempt and the icon
+silently never appears for the rest of the session.
 
 If you don't have a tray host and would rather not set one up, the
 `waybar` subcommand below gives you the same information as a plain bar
