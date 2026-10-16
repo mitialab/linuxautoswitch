@@ -1260,6 +1260,19 @@ mod tests {
     }
 
     #[test]
+    fn engine_new_lowercases_exclusion_patterns() {
+        // Users may write patterns in any case; `Engine::new` must normalize
+        // them, since `steam::class_matches` assumes lowercase input.
+        let mut cfg = Config::default();
+        cfg.general.exclude_steam_games = false;
+        cfg.general.excluded_classes = vec!["Kitty".to_string(), "Steam_App_*".to_string()];
+        let engine = Engine::new(cfg);
+        assert!(compute_excluded("KITTY", 0, &engine.cfg));
+        assert!(compute_excluded("steam_app_1234", 0, &engine.cfg));
+        assert!(!compute_excluded("firefox", 0, &engine.cfg));
+    }
+
+    #[test]
     fn control_toggle_flips_paused_and_reports_state() {
         let mut engine = Engine::new(Config::default());
         engine.last_lang = Some(Lang::Ru);

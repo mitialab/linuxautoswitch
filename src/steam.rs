@@ -64,6 +64,12 @@ fn parent_pid(pid: i32) -> Option<i32> {
 /// and the window class once per focus change, rather than per pattern
 /// per call.
 pub fn class_matches(class: &str, pattern: &str) -> bool {
+    debug_assert_eq!(class, class.to_lowercase(), "class must be lowercased");
+    debug_assert_eq!(
+        pattern,
+        pattern.to_lowercase(),
+        "pattern must be lowercased"
+    );
     match pattern.strip_suffix('*') {
         Some(prefix) => class.starts_with(prefix),
         None => class == pattern,
