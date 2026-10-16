@@ -308,7 +308,7 @@ fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     });
 
     let mut engine = engine::Engine::new(cfg);
-    let mut last_tray_status: Option<control::ControlResponse> = None;
+    let mut last_tray_status: Option<engine::Status> = None;
     for event in rx {
         match event {
             Event::Key {
@@ -331,29 +331,23 @@ fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             }
         }
 
-        // Cheap to compute (no I/O); only push to the tray - which crosses
-        // threads and emits D-Bus signals - when something visible actually
-        // changed, rather than on every keystroke. The tray spawns in the
-        // background (see tray::spawn) and may not be in the slot yet.
-        if let Some(handle) = tray_handle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
+        // Cheap to compute (a Copy struct, no I/O, no allocation); only push
+        // to the tray - which crosses threads and emits D-Bus signals - when
+        // something visible actually changed, rather than on every
+        // keystroke. The tray spawns in the background (see tray::spawn) and
+        // may not be in the slot yet.
+        let status = engine.status();
+        if last_tray_status != Some(status)
+            && let Some(handle) = tray_handle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
         {
-            let status = engine.handle_control(control::ControlRequest::Status);
-            if last_tray_status.as_ref() != Some(&status) {
-                let lang = status.lang.as_deref().and_then(|s| match s {
-                    "en" => Some(keymap::Lang::En),
-                    "ru" => Some(keymap::Lang::Ru),
-                    _ => None,
-                });
-                let paused = status.paused;
-                handle.update(|tray| {
-                    tray.paused = paused;
-                    tray.lang = lang;
-                });
-                last_tray_status = Some(status);
-            }
+            handle.update(|tray| {
+                tray.paused = status.paused;
+                tray.lang = status.lang;
+            });
+            last_tray_status = Some(status);
         }
     }
 

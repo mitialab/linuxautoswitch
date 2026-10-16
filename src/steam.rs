@@ -58,11 +58,12 @@ fn parent_pid(pid: i32) -> Option<i32> {
     fields.next()?.parse().ok()
 }
 
-/// Case-insensitive glob match supporting a single trailing `*`, e.g.
-/// `"steam_app_*"`. Used for `general.excluded_classes`.
+/// Glob match supporting a single trailing `*`, e.g. `"steam_app_*"`. Used
+/// for `general.excluded_classes`. Both arguments must already be
+/// lowercase: patterns are lowercased once at startup (see `Engine::new`)
+/// and the window class once per focus change, rather than per pattern
+/// per call.
 pub fn class_matches(class: &str, pattern: &str) -> bool {
-    let class = class.to_lowercase();
-    let pattern = pattern.to_lowercase();
     match pattern.strip_suffix('*') {
         Some(prefix) => class.starts_with(prefix),
         None => class == pattern,
@@ -80,8 +81,8 @@ mod tests {
     }
 
     #[test]
-    fn exact_match_is_case_insensitive() {
-        assert!(class_matches("Kitty", "kitty"));
+    fn exact_match_is_not_a_prefix_match() {
+        assert!(class_matches("kitty", "kitty"));
         assert!(!class_matches("kittycat", "kitty"));
     }
 }
