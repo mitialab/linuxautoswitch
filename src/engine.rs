@@ -62,6 +62,16 @@ fn modifier_bit(code: KeyCode) -> Option<u8> {
 /// stops growing and no correction is attempted until the next boundary.
 const MAX_WORD_KEYS: usize = 64;
 
+/// A snapshot of the daemon's externally visible state; see
+/// [`Engine::status`]. `Copy` and allocation-free, so it can be compared
+/// per keystroke.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Status {
+    pub paused: bool,
+    pub lang: Option<Lang>,
+    pub excluded: bool,
+}
+
 pub struct Engine {
     cfg: Config,
     buffer: Vec<TypedKey>,
@@ -646,12 +656,25 @@ impl Engine {
             control::ControlRequest::Resume => self.paused = false,
             control::ControlRequest::Toggle => self.paused = !self.paused,
         }
+        let status = self.status();
         control::ControlResponse {
-            paused: self.paused,
-            lang: self.last_lang.map(|lang| match lang {
+            paused: status.paused,
+            lang: status.lang.map(|lang| match lang {
                 Lang::En => "en".to_string(),
                 Lang::Ru => "ru".to_string(),
             }),
+            excluded: status.excluded,
+        }
+    }
+
+    /// The daemon's currently visible state as a cheap, allocation-free,
+    /// `Copy` snapshot - unlike `handle_control`, which allocates a String
+    /// for the language, so the event loop can poll this on every keystroke
+    /// to decide whether the tray icon needs an update.
+    pub fn status(&self) -> Status {
+        Status {
+            paused: self.paused,
+            lang: self.last_lang,
             excluded: self.excluded,
         }
     }
@@ -767,12 +790,15 @@ fn trim_trailing_punctuation(word: &str) -> &str {
 /// `cfg.general.excluded_classes` must already be lowercased (see
 /// `Engine::new`). A trailing `*` in a pattern matches as a prefix.
 fn compute_excluded(class: &str, pid: i32, cfg: &Config) -> bool {
+    // Lowercase the class once rather than per pattern (see
+    // `steam::class_matches`'s contract).
+    let class_lower = class.to_lowercase();
     let class_excluded = !class.is_empty()
         && cfg
             .general
             .excluded_classes
             .iter()
-            .any(|pattern| steam::class_matches(class, pattern));
+            .any(|pattern| steam::class_matches(&class_lower, pattern));
     if class_excluded {
         return true;
     }
@@ -1219,6 +1245,31 @@ mod tests {
         let engine = Engine::new(cfg);
         assert_eq!(engine.toggle_pause_mask, 0);
         assert_eq!(engine.manual_correct_key, None);
+    }
+
+    #[test]
+    fn exclusion_matching_is_case_insensitive() {
+        // Patterns arrive already lowercased (see `Engine::new`);
+        // `compute_excluded` lowercases the window class once per call.
+        let mut cfg = Config::default();
+        cfg.general.exclude_steam_games = false;
+        cfg.general.excluded_classes = vec!["kitty".to_string(), "steam_app_*".to_string()];
+        assert!(compute_excluded("Kitty", 0, &cfg));
+        assert!(compute_excluded("Steam_App_1234", 0, &cfg));
+        assert!(!compute_excluded("firefox", 0, &cfg));
+    }
+
+    #[test]
+    fn engine_new_lowercases_exclusion_patterns() {
+        // Users may write patterns in any case; `Engine::new` must normalize
+        // them, since `steam::class_matches` assumes lowercase input.
+        let mut cfg = Config::default();
+        cfg.general.exclude_steam_games = false;
+        cfg.general.excluded_classes = vec!["Kitty".to_string(), "Steam_App_*".to_string()];
+        let engine = Engine::new(cfg);
+        assert!(compute_excluded("KITTY", 0, &engine.cfg));
+        assert!(compute_excluded("steam_app_1234", 0, &engine.cfg));
+        assert!(!compute_excluded("firefox", 0, &engine.cfg));
     }
 
     #[test]

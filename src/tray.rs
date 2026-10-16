@@ -350,8 +350,9 @@ mod tests {
         let text = contrasting_text(FILL);
         assert!(
             icon.data
-                .chunks_exact(4)
-                .any(|p| p == [255, text.0, text.1, text.2])
+                .as_chunks::<4>()
+                .0
+                .contains(&[255, text.0, text.1, text.2])
         );
     }
 
@@ -361,8 +362,9 @@ mod tests {
         let text = contrasting_text(FILL);
         assert!(
             icon.data
-                .chunks_exact(4)
-                .any(|p| p == [255, text.0, text.1, text.2])
+                .as_chunks::<4>()
+                .0
+                .contains(&[255, text.0, text.1, text.2])
         );
     }
 

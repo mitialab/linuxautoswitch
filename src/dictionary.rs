@@ -10,6 +10,7 @@
 
 use crate::keymap::Lang;
 use fst::Set;
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 static EN_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/en.fst"));
@@ -28,7 +29,14 @@ fn ru() -> &'static Set<&'static [u8]> {
 
 /// Whether `word` is a known word in `lang`. Case-insensitive.
 pub fn contains(lang: Lang, word: &str) -> bool {
-    let lower = word.to_lowercase();
+    // Borrow instead of allocating when there's nothing to lowercase, which
+    // is the common case for typed words - this runs on every keystroke
+    // under eager correction.
+    let lower: Cow<'_, str> = if word.chars().any(char::is_uppercase) {
+        Cow::Owned(word.to_lowercase())
+    } else {
+        Cow::Borrowed(word)
+    };
     match lang {
         Lang::En => en().contains(lower.as_bytes()),
         Lang::Ru => ru().contains(lower.as_bytes()),
