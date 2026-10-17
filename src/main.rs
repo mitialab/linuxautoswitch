@@ -59,6 +59,11 @@ enum Event {
         code: KeyCode,
         value: i32,
     },
+    /// A keyboard's Caps Lock LED changed (or was read when it was opened).
+    CapsLed {
+        device: Arc<str>,
+        on: bool,
+    },
     Hypr(hypr::HyprEvent),
     /// A new keyboard device was plugged in.
     KeyboardsChanged,
@@ -148,7 +153,14 @@ fn scan_devices(seen: &Seen, tx: &Sender<Event>) -> usize {
             Err(e) => {
                 // udev may not have granted access to a brand-new node yet;
                 // try again on the next scan.
-                tracing::debug!(path = %path.display(), "could not open input device: {e}");
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "no permission to open input device - is this user in the `input` group?"
+                    );
+                } else {
+                    tracing::debug!(path = %path.display(), "could not open input device: {e}");
+                }
                 forget(seen, &path);
                 continue;
             }
@@ -171,20 +183,38 @@ fn forget(seen: &Seen, path: &Path) {
 fn watch_device(path: PathBuf, mut device: evdev::Device, seen: Seen, tx: Sender<Event>) {
     let name: Arc<str> = Arc::from(device.name().unwrap_or("unknown-keyboard"));
     tracing::info!(path = %path.display(), name = %name, "watching keyboard device");
+    let has_caps_led = device
+        .supported_leds()
+        .is_some_and(|leds| leds.contains(evdev::LedCode::LED_CAPSL));
+    if has_caps_led {
+        let on = device
+            .get_led_state()
+            .is_ok_and(|leds| leds.contains(evdev::LedCode::LED_CAPSL));
+        let _ = tx.send(Event::CapsLed {
+            device: name.clone(),
+            on,
+        });
+    }
     thread::spawn(move || {
         loop {
             match device.fetch_events() {
                 Ok(events) => {
                     for ev in events {
-                        if let evdev::EventSummary::Key(_, code, value) = ev.destructure()
-                            && tx
-                                .send(Event::Key {
+                        let event = match ev.destructure() {
+                            evdev::EventSummary::Key(_, code, value) => Event::Key {
+                                device: name.clone(),
+                                code,
+                                value,
+                            },
+                            evdev::EventSummary::Led(_, evdev::LedCode::LED_CAPSL, value) => {
+                                Event::CapsLed {
                                     device: name.clone(),
-                                    code,
-                                    value,
-                                })
-                                .is_err()
-                        {
+                                    on: value != 0,
+                                }
+                            }
+                            _ => continue,
+                        };
+                        if tx.send(event).is_err() {
                             return;
                         }
                     }
@@ -194,6 +224,7 @@ fn watch_device(path: PathBuf, mut device: evdev::Device, seen: Seen, tx: Sender
                     // If the same node comes back (e.g. replugged), the next
                     // scan picks it up again.
                     forget(&seen, &path);
+                    let _ = tx.send(Event::KeyboardsChanged);
                     return;
                 }
             }
@@ -316,6 +347,7 @@ fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                 code,
                 value,
             } => engine.handle_key(&device, code, value),
+            Event::CapsLed { device, on } => engine.set_capslock_led(&device, on),
             Event::Hypr(ev) => engine.handle_hypr(ev),
             Event::KeyboardsChanged => engine.refresh_keyboards(),
             Event::Control(ev) => {

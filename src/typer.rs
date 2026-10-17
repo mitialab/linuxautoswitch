@@ -28,6 +28,8 @@ fn wtype_args(backspace_count: usize, replacement: &str) -> Vec<&str> {
         args.extend(["-k", "BackSpace"]);
     }
     if !replacement.is_empty() {
+        // "--" so text starting with "-" is typed, not parsed as an option.
+        args.push("--");
         args.push(replacement);
     }
     args
@@ -41,7 +43,7 @@ mod tests {
     fn deletes_then_types() {
         assert_eq!(
             wtype_args(2, "ok "),
-            ["-k", "BackSpace", "-k", "BackSpace", "ok "]
+            ["-k", "BackSpace", "-k", "BackSpace", "--", "ok "]
         );
     }
 

@@ -33,12 +33,18 @@ fn event_socket_path() -> Result<PathBuf> {
     Ok(runtime_dir()?.join(".socket2.sock"))
 }
 
+const IPC_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Sends a single command (exactly what you'd pass to `hyprctl`) and
 /// returns its response. Prefix with `j/` for JSON output.
 pub fn send_command(cmd: &str) -> Result<String> {
     let path = cmd_socket_path()?;
     let mut stream =
         UnixStream::connect(&path).with_context(|| format!("connecting to {}", path.display()))?;
+    // Commands run on the engine's event loop; a stuck compositor must not
+    // freeze it forever.
+    stream.set_read_timeout(Some(IPC_TIMEOUT))?;
+    stream.set_write_timeout(Some(IPC_TIMEOUT))?;
     stream.write_all(cmd.as_bytes())?;
     stream.shutdown(std::net::Shutdown::Write)?;
     let mut response = String::new();

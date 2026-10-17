@@ -84,12 +84,7 @@ pub fn serve<T: From<ControlEvent> + Send + 'static>(tx: Sender<T>) -> Result<()
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let listener = UnixListener::bind(&path)
-        .with_context(|| format!("binding control socket at {}", path.display()))?;
-    // Owner only: without XDG_RUNTIME_DIR the socket lands in the shared
-    // /tmp, where any local user could otherwise pause the daemon.
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("restricting permissions on {}", path.display()))?;
+    let listener = bind_private(&path)?;
     tracing::info!(path = %path.display(), "control socket listening");
 
     thread::spawn(move || {
@@ -104,6 +99,36 @@ pub fn serve<T: From<ControlEvent> + Send + 'static>(tx: Sender<T>) -> Result<()
         }
     });
     Ok(())
+}
+
+/// Binds `path` so it is never reachable by other users, not even briefly.
+/// Without XDG_RUNTIME_DIR the socket lands in the shared /tmp, where any
+/// local user could otherwise pause the daemon in the gap between `bind`
+/// and `chmod`. The socket is therefore created in a private (0700)
+/// directory, restricted to 0600, and only then renamed into place.
+fn bind_private(path: &std::path::Path) -> Result<UnixListener> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let private = parent.join(format!(".linuxautoswitch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&private);
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&private)
+            .with_context(|| format!("creating {}", private.display()))?;
+    }
+    let result = (|| {
+        let tmp = private.join("sock");
+        let listener = UnixListener::bind(&tmp)
+            .with_context(|| format!("binding control socket at {}", tmp.display()))?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting permissions on {}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("moving control socket to {}", path.display()))?;
+        Ok(listener)
+    })();
+    let _ = std::fs::remove_dir_all(&private);
+    result
 }
 
 fn handle_connection<T: From<ControlEvent>>(mut stream: UnixStream, tx: &Sender<T>) -> Result<()> {
@@ -156,4 +181,23 @@ pub fn send_command(command: &str) -> Result<ControlResponse> {
     let mut line = String::new();
     reader.read_line(&mut line)?;
     serde_json::from_str(&line).context("parsing daemon response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bind_private_creates_an_owner_only_socket_and_cleans_up() {
+        let dir = std::env::temp_dir().join(format!("las-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.sock");
+        let _listener = bind_private(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(UnixStream::connect(&path).is_ok());
+        let leftovers = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(leftovers, 1, "only the socket should remain");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
