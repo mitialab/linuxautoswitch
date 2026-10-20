@@ -28,6 +28,18 @@ struct LastWord {
     /// Spaces typed after the word, between it and the cursor. A flip has to
     /// delete and retype them too.
     trailing_spaces: usize,
+    /// Set when the daemon itself put this word on screen by correcting a
+    /// wrong-layout one; flipping it straight back is an "undo" it can
+    /// learn from.
+    auto: Option<AutoFix>,
+}
+
+/// What an automatic correction replaced.
+struct AutoFix {
+    /// The text as typed, before the correction.
+    typed: String,
+    /// The layout it was typed in.
+    from: Lang,
 }
 
 /// One bit per physical modifier key, so releasing one side of a pair
@@ -496,6 +508,7 @@ impl Engine {
                 keys: self.buffer.clone(),
                 lang_on_screen: lang,
                 trailing_spaces: 1,
+                auto: None,
             });
         }
         if password::ends_token(code) {
@@ -638,6 +651,10 @@ impl Engine {
         // (a name that happened to also look wrong in the dictionary's
         // eyes), the manual flip hotkey can undo this.
         self.last_word = Some(LastWord {
+            auto: Some(AutoFix {
+                typed: on_screen_text(&keys_snapshot, current_lang),
+                from: current_lang,
+            }),
             keys: keys_snapshot,
             lang_on_screen: other_lang,
             trailing_spaces,
@@ -836,15 +853,26 @@ impl Engine {
             keys,
             lang_on_screen,
             trailing_spaces,
+            auto,
         }) = self.last_word.take()
             && let Some(new_lang) =
                 self.flip_and_retype(&keys, lang_on_screen, trailing_spaces, source_device)
         {
+            // Flipping an automatic correction straight back is an undo: the
+            // person is saying the text was meant as typed.
+            if let Some(AutoFix { typed, from }) = auto
+                && new_lang == from
+                && self.cfg.experimental.learn_from_undo
+                && self.user.reject(from, trim_trailing_punctuation(&typed))
+            {
+                tracing::info!(word = %typed, "learned: leaving this alone from now on");
+            }
             // Toggle back and forth on repeated presses, same as Caramba.
             self.last_word = Some(LastWord {
                 keys,
                 lang_on_screen: new_lang,
                 trailing_spaces,
+                auto: None,
             });
         }
     }
@@ -1018,6 +1046,10 @@ fn correction(
     if other_core.chars().count() < min_word_length {
         return None;
     }
+    // The person undid a correction of exactly this text before.
+    if user.is_rejected(current_lang, typed_core) {
+        return None;
+    }
 
     // Already a real word in the layout that's actually active: nothing
     // to do.
@@ -1113,6 +1145,7 @@ pub(crate) fn apply_case_pattern(source: &str, target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     const DOWN: i32 = 1;
     const REPEAT: i32 = 2;
@@ -1826,6 +1859,75 @@ mod tests {
         (KeyCode::KEY_L, false),
         (KeyCode::KEY_O, false),
     ];
+
+    fn learning_engine(name: &str) -> (Engine, std::rc::Rc<std::cell::RefCell<Script>>, PathBuf) {
+        let path = std::env::temp_dir()
+            .join(format!("las-engine-learn-{}-{name}", std::process::id()))
+            .join("learned.txt");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let (engine, script) = scripted_engine(|cfg| cfg.experimental.learn_from_undo = true);
+        let engine = engine.with_user_data(UserData::default().with_learning(path.clone()));
+        (engine, script, path)
+    }
+
+    fn double_tap_shift(engine: &mut Engine) {
+        tap(engine, KeyCode::KEY_LEFTSHIFT);
+        tap(engine, KeyCode::KEY_LEFTSHIFT);
+    }
+
+    #[test]
+    fn undoing_a_correction_teaches_the_daemon_to_leave_that_text_alone() {
+        let (mut engine, script, path) = learning_engine("undo");
+        type_privet_and_space(&mut engine);
+        assert_eq!(script.borrow().calls.len(), 3); // switch, type, read: corrected
+        // Double-Shift flips it straight back: "привет" -> "ghbdtn".
+        double_tap_shift(&mut engine);
+        assert!(
+            script
+                .borrow()
+                .calls
+                .iter()
+                .any(|c| c.contains("\"ghbdtn \""))
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "en\tghbdtn\n");
+
+        let calls_before = script.borrow().calls.len();
+        type_privet_and_space(&mut engine);
+        assert_eq!(script.borrow().calls.len(), calls_before, "corrected again");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn flipping_a_word_the_daemon_did_not_correct_teaches_nothing() {
+        let (mut engine, script, path) = learning_engine("manual");
+        // "qxz" is gibberish in both languages: not corrected, flipped by hand.
+        for code in [KeyCode::KEY_Q, KeyCode::KEY_X, KeyCode::KEY_Z] {
+            tap(&mut engine, code);
+        }
+        tap(&mut engine, KeyCode::KEY_SPACE);
+        double_tap_shift(&mut engine);
+        assert!(!script.borrow().calls.is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn nothing_is_learned_without_the_option() {
+        let (engine, script) = scripted_engine(|_| {});
+        let path = std::env::temp_dir()
+            .join(format!("las-engine-learn-{}-off", std::process::id()))
+            .join("learned.txt");
+        let mut engine = engine.with_user_data(UserData::default().with_learning(path.clone()));
+        type_privet_and_space(&mut engine);
+        double_tap_shift(&mut engine);
+        assert!(
+            script
+                .borrow()
+                .calls
+                .iter()
+                .any(|c| c.contains("\"ghbdtn \""))
+        );
+        assert!(!path.exists());
+    }
 
     #[test]
     fn double_caps_is_fixed_at_space_when_enabled() {

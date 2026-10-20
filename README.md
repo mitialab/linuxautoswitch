@@ -237,6 +237,13 @@ Off by default; switch one on in the `[experimental]` table of `config.toml`
   list of frequent words: `еще` -> `ещё`, `идет` -> `идёт`, `ребенок` ->
   `ребёнок`. Words whose spelling without ё is a different word (`все`/`всё`,
   `чем`/`чём`, `мед`/`мёд`) are deliberately not on the list.
+- `learn_from_undo` - when an automatic correction was wrong and you undo it
+  with the manual-flip hotkey (double-tap Shift), remember the text as you
+  typed it and never correct it again. Kept in
+  `~/.local/state/linuxautoswitch/learned.txt` (`$XDG_STATE_HOME` is
+  honored), one `en<TAB>word` or `ru<TAB>word` per line; delete a line, or the
+  file, to forget. Words under three letters are ignored, and flipping a word
+  the daemon didn't correct teaches it nothing.
 
 ## Checking status: shell, tray icon, or status bar
 

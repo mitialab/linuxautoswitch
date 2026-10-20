@@ -335,7 +335,11 @@ fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         }
     });
 
-    let mut engine = engine::Engine::new(cfg).with_user_data(userdata::UserData::load(&config_dir));
+    let mut user = userdata::UserData::load(&config_dir);
+    if cfg.experimental.learn_from_undo {
+        user = user.with_learning(config::state_dir().join("learned.txt"));
+    }
+    let mut engine = engine::Engine::new(cfg).with_user_data(user);
     let mut last_tray_status: Option<engine::Status> = None;
     for event in rx {
         match event {

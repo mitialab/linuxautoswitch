@@ -14,9 +14,11 @@
 //! The files are read once at startup; restart the daemon after editing.
 
 use crate::keymap::Lang;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::Write;
 use std::ops::Bound;
 use std::path::Path;
+use std::path::PathBuf;
 
 #[derive(Default)]
 pub struct UserData {
@@ -24,7 +26,20 @@ pub struct UserData {
     ru: BTreeSet<String>,
     typos_en: HashMap<String, String>,
     typos_ru: HashMap<String, String>,
+    learned: Option<Learned>,
 }
+
+/// Text the person undid an automatic correction of: typed in this layout,
+/// it is left alone from now on. Persisted as `en<TAB>word` lines.
+struct Learned {
+    path: PathBuf,
+    rejected: HashSet<(Lang, String)>,
+}
+
+/// Stop learning past this many words, so the file and the set stay small.
+const MAX_LEARNED: usize = 5000;
+/// Shorter than this is too likely to be a coincidence, not a decision.
+const MIN_LEARNED_LETTERS: usize = 3;
 
 impl UserData {
     /// Reads the word lists from `dir`. A missing file is just an empty list;
@@ -59,7 +74,69 @@ impl UserData {
             ru: read("words-ru.txt"),
             typos_en: read_typos("typos-en.txt"),
             typos_ru: read_typos("typos-ru.txt"),
+            learned: None,
         }
+    }
+
+    /// Turns on learning from undone corrections, kept in `path`. Existing
+    /// lines are loaded; a missing file is fine.
+    pub fn with_learning(mut self, path: PathBuf) -> Self {
+        let rejected = match std::fs::read_to_string(&path) {
+            Ok(text) => parse_learned(&text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "could not read learned words: {e}");
+                HashSet::new()
+            }
+        };
+        tracing::info!(words = rejected.len(), "learning from undone corrections");
+        self.learned = Some(Learned { path, rejected });
+        self
+    }
+
+    /// Whether the person undid a correction of `word` typed in `lang`.
+    /// Always false unless learning is on.
+    pub fn is_rejected(&self, lang: Lang, word: &str) -> bool {
+        self.learned.as_ref().is_some_and(|l| {
+            !l.rejected.is_empty() && l.rejected.contains(&(lang, word.to_lowercase()))
+        })
+    }
+
+    /// Remembers that `word`, typed in `lang`, should not be corrected.
+    /// Returns whether it was newly learned (and written to disk).
+    pub fn reject(&mut self, lang: Lang, word: &str) -> bool {
+        let Some(learned) = &mut self.learned else {
+            return false;
+        };
+        let word = word.to_lowercase();
+        if word.chars().filter(|c| c.is_alphabetic()).count() < MIN_LEARNED_LETTERS
+            || word
+                .chars()
+                .any(|c| c.is_whitespace() || !c.is_alphabetic() && !"'-".contains(c))
+            || learned.rejected.len() >= MAX_LEARNED
+            || !learned.rejected.insert((lang, word.clone()))
+        {
+            return false;
+        }
+        let tag = match lang {
+            Lang::En => "en",
+            Lang::Ru => "ru",
+        };
+        let written = learned
+            .path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&learned.path)
+            })
+            .and_then(|mut file| writeln!(file, "{tag}\t{word}"));
+        if let Err(e) = written {
+            tracing::warn!(path = %learned.path.display(), "could not save learned word: {e}");
+        }
+        true
     }
 
     /// The person's own fix for the misspelling `word` in `lang`, if any.
@@ -101,6 +178,21 @@ impl UserData {
             .take_while(|w| w.starts_with(&prefix))
             .any(|w| w.len() > prefix.len())
     }
+}
+
+fn parse_learned(text: &str) -> HashSet<(Lang, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let (tag, word) = line.split_once('\t')?;
+            let lang = match tag {
+                "en" => Lang::En,
+                "ru" => Lang::Ru,
+                _ => return None,
+            };
+            let word = word.trim().to_lowercase();
+            (!word.is_empty()).then_some((lang, word))
+        })
+        .collect()
 }
 
 /// `wrong right...` pairs, one per line; `#` starts a comment.
@@ -169,6 +261,55 @@ mod tests {
         assert_eq!(typos.len(), 2);
         assert_eq!(typos["teh"], "the");
         assert_eq!(typos["vobshem"], "в общем");
+    }
+
+    fn temp_file(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("las-learned-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("learned.txt")
+    }
+
+    #[test]
+    fn learned_words_are_saved_and_reloaded() {
+        let path = temp_file("roundtrip");
+        let mut user = UserData::default().with_learning(path.clone());
+        assert!(!user.is_rejected(Lang::En, "ghbdtn"));
+        assert!(user.reject(Lang::En, "Ghbdtn"));
+        assert!(user.is_rejected(Lang::En, "GHBDTN"));
+        assert!(!user.is_rejected(Lang::Ru, "ghbdtn")); // per layout
+        assert!(!user.reject(Lang::En, "ghbdtn")); // already known: no duplicate line
+
+        let reloaded = UserData::default().with_learning(path.clone());
+        assert!(reloaded.is_rejected(Lang::En, "ghbdtn"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "en\tghbdtn\n");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn nothing_is_learned_or_applied_when_learning_is_off() {
+        let mut user = UserData::default();
+        assert!(!user.reject(Lang::En, "ghbdtn"));
+        assert!(!user.is_rejected(Lang::En, "ghbdtn"));
+    }
+
+    #[test]
+    fn short_or_odd_text_is_not_learned() {
+        let path = temp_file("guards");
+        let mut user = UserData::default().with_learning(path.clone());
+        for word in ["ab", "x", "", "a b c", "abc123", "ab.", "две слова"] {
+            assert!(!user.reject(Lang::En, word), "{word:?}");
+        }
+        assert!(user.reject(Lang::En, "don't"));
+        assert!(user.reject(Lang::Ru, "кто-то"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn learned_file_ignores_junk_lines() {
+        let parsed = parse_learned("en\tfoo\nxx\tbar\nru\t\nbroken\nru\tЯблоко\n");
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.contains(&(Lang::En, "foo".to_string())));
+        assert!(parsed.contains(&(Lang::Ru, "яблоко".to_string())));
     }
 
     #[test]

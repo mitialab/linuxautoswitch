@@ -199,6 +199,11 @@ pub struct Experimental {
     /// Put the letter ё where the language requires it, for a short list of
     /// frequent words: "еще" -> "ещё", "идет" -> "идёт".
     pub yofikator: bool,
+    /// When you undo an automatic correction with the manual-flip hotkey, remember the
+    /// text as typed and never correct it again (kept in
+    /// `$XDG_STATE_HOME/linuxautoswitch/learned.txt`; delete lines, or the
+    /// file, to forget). Ignores anything under three letters.
+    pub learn_from_undo: bool,
 }
 
 pub fn default_path() -> PathBuf {
@@ -208,6 +213,18 @@ pub fn default_path() -> PathBuf {
             PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string())).join(".config")
         });
     base.join("linuxautoswitch").join("config.toml")
+}
+
+/// Where the daemon keeps what it learns: `$XDG_STATE_HOME/linuxautoswitch`,
+/// or `~/.local/state/linuxautoswitch`.
+pub fn state_dir() -> PathBuf {
+    let base = std::env::var("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
+                .join(".local/state")
+        });
+    base.join("linuxautoswitch")
 }
 
 /// The directory holding `config.toml` (and the user's word lists).

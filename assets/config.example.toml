@@ -146,3 +146,10 @@ typo_correction = false
 # Words whose spelling without ё is a different word (все/всё, чем/чём) are
 # deliberately left out.
 yofikator = false
+
+# When an automatic correction was wrong and you undo it with the manual-flip
+# hotkey, remember the text as you typed it and never correct it again. Kept in
+# ~/.local/state/linuxautoswitch/learned.txt (one `en<TAB>word` or
+# `ru<TAB>word` per line; delete a line, or the file, to forget). Ignores
+# anything under three letters.
+learn_from_undo = false
