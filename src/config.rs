@@ -287,5 +287,14 @@ mod tests {
             a.layout_switch_retry_delay_ms,
             b.layout_switch_retry_delay_ms
         );
+        // Experimental features are documented in the example and must be
+        // off there, exactly as without a config file.
+        let (a, b) = (&example.experimental, &default.experimental);
+        assert_eq!(a.password_guard, b.password_guard);
+        assert_eq!(a.double_caps_fix, b.double_caps_fix);
+        assert_eq!(a.typo_correction, b.typo_correction);
+        assert_eq!(a.yofikator, b.yofikator);
+        assert_eq!(a.learn_from_undo, b.learn_from_undo);
+        assert!(!a.password_guard && !a.learn_from_undo);
     }
 }
