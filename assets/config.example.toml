@@ -134,3 +134,15 @@ password_guard = false
 # "ПРивет" -> "Привет", "HEllo" -> "Hello". Only when the lowercase form is a
 # real word, so "PRs", "TVs", "MHz" and "GPUs" are never touched.
 double_caps_fix = false
+
+# Fix common misspellings when you finish a word with Space: "teh" -> "the",
+# "сдесь" -> "здесь", "вобщем" -> "в общем". A built-in table, plus your own
+# pairs in typos-en.txt / typos-ru.txt next to this file (one `wrong right`
+# per line; restart the daemon after editing).
+typo_correction = false
+
+# Put the letter ё where the language requires it, for a short list of
+# frequent words: "еще" -> "ещё", "идет" -> "идёт", "ребенок" -> "ребёнок".
+# Words whose spelling without ё is a different word (все/всё, чем/чём) are
+# deliberately left out.
+yofikator = false

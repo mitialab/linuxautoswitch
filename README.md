@@ -227,6 +227,16 @@ Off by default; switch one on in the `[experimental]` table of `config.toml`
   capitals followed by at least two lowercase letters (four letters in all)
   whose lowercase form is a real word, so `PRs`, `TVs`, `MHz`, `GPUs` and
   `iPhone` are never touched.
+- `typo_correction` - when Space ends a word, fix common misspellings from a
+  built-in table (`teh` -> `the`, `сдесь` -> `здесь`, `вобщем` -> `в общем`).
+  Add your own `wrong right` pairs, one per line, to `typos-en.txt` /
+  `typos-ru.txt` next to `config.toml`; yours win over the built-in ones. The
+  table never looks at the dictionary, so it only holds spellings that are
+  never correct.
+- `yofikator` - put the letter ё where the language requires it, for a short
+  list of frequent words: `еще` -> `ещё`, `идет` -> `идёт`, `ребенок` ->
+  `ребёнок`. Words whose spelling without ё is a different word (`все`/`всё`,
+  `чем`/`чём`, `мед`/`мёд`) are deliberately not on the list.
 
 ## Checking status: shell, tray icon, or status bar
 

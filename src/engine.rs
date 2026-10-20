@@ -1094,7 +1094,7 @@ fn detect_lang(desc: &str, cfg: &Config) -> Option<Lang> {
 /// typed) onto `target` (the corrected word): all-caps stays all-caps,
 /// capitalized-first-letter stays capitalized, everything else is left
 /// lowercase.
-fn apply_case_pattern(source: &str, target: &str) -> String {
+pub(crate) fn apply_case_pattern(source: &str, target: &str) -> String {
     let letters: Vec<char> = source.chars().filter(|c| c.is_alphabetic()).collect();
     let all_upper = !letters.is_empty() && letters.iter().all(|c| c.is_uppercase());
     if all_upper {
@@ -1836,6 +1836,38 @@ mod tests {
         // 5 letters + the Space, retyped with the second capital lowered.
         assert_eq!(script.borrow().calls, ["type 6 \"Hello \" 0"]);
         assert_eq!(engine.last_word.unwrap().lang_on_screen, Lang::En);
+    }
+
+    #[test]
+    fn typo_is_fixed_at_space_when_enabled() {
+        let (mut engine, script) = scripted_engine(|cfg| cfg.experimental.typo_correction = true);
+        for code in [KeyCode::KEY_T, KeyCode::KEY_E, KeyCode::KEY_H] {
+            tap(&mut engine, code);
+        }
+        tap(&mut engine, KeyCode::KEY_SPACE);
+        assert_eq!(script.borrow().calls, ["type 4 \"the \" 0"]);
+    }
+
+    #[test]
+    fn yo_is_restored_on_the_russian_layout_only() {
+        let (mut engine, script) = scripted_engine(|cfg| cfg.experimental.yofikator = true);
+        engine.last_lang = Some(Lang::Ru);
+        // T O T = "еще" on the Russian layout.
+        for code in [KeyCode::KEY_T, KeyCode::KEY_O, KeyCode::KEY_T] {
+            tap(&mut engine, code);
+        }
+        tap(&mut engine, KeyCode::KEY_SPACE);
+        assert_eq!(script.borrow().calls, ["type 4 \"ещё \" 0"]);
+    }
+
+    #[test]
+    fn typo_and_yo_do_nothing_unless_enabled() {
+        let (mut engine, script) = scripted_engine(|_| {});
+        for code in [KeyCode::KEY_T, KeyCode::KEY_E, KeyCode::KEY_H] {
+            tap(&mut engine, code);
+        }
+        tap(&mut engine, KeyCode::KEY_SPACE);
+        assert!(script.borrow().calls.is_empty());
     }
 
     #[test]

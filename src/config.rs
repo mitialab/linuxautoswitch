@@ -192,6 +192,13 @@ pub struct Experimental {
     /// "ПРивет" -> "Привет". Only when the lowercase form is a real word, so
     /// "PRs", "TVs" and "MHz" stay as they are.
     pub double_caps_fix: bool,
+    /// Fix common misspellings when Space ends the word: "teh" -> "the",
+    /// "сдесь" -> "здесь". A built-in table plus your own `typos-en.txt` /
+    /// `typos-ru.txt`.
+    pub typo_correction: bool,
+    /// Put the letter ё where the language requires it, for a short list of
+    /// frequent words: "еще" -> "ещё", "идет" -> "идёт".
+    pub yofikator: bool,
 }
 
 pub fn default_path() -> PathBuf {

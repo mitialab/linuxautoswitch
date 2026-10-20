@@ -7,10 +7,14 @@
 //!   it is neither "fixed" when typed in its own layout nor mistaken for
 //!   gibberish when it is typed in the other one.
 //!
+//! - `typos-en.txt` / `typos-ru.txt` - your own typo fixes, one `wrong right`
+//!   pair per line (the right side may be several words). Used by the
+//!   `typo_correction` experimental feature, on top of the built-in table.
+//!
 //! The files are read once at startup; restart the daemon after editing.
 
 use crate::keymap::Lang;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Bound;
 use std::path::Path;
 
@@ -18,6 +22,8 @@ use std::path::Path;
 pub struct UserData {
     en: BTreeSet<String>,
     ru: BTreeSet<String>,
+    typos_en: HashMap<String, String>,
+    typos_ru: HashMap<String, String>,
 }
 
 impl UserData {
@@ -36,10 +42,37 @@ impl UserData {
                 BTreeSet::new()
             }
         };
+        let read_typos = |name: &str| match std::fs::read_to_string(dir.join(name)) {
+            Ok(text) => {
+                let typos = parse_typo_list(&text);
+                tracing::info!(file = name, typos = typos.len(), "loaded user typo list");
+                typos
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(e) => {
+                tracing::warn!(file = name, "could not read user typo list: {e}");
+                HashMap::new()
+            }
+        };
         Self {
             en: read("words-en.txt"),
             ru: read("words-ru.txt"),
+            typos_en: read_typos("typos-en.txt"),
+            typos_ru: read_typos("typos-ru.txt"),
         }
+    }
+
+    /// The person's own fix for the misspelling `word` in `lang`, if any.
+    /// Case-insensitive.
+    pub fn typo(&self, lang: Lang, word: &str) -> Option<&str> {
+        let typos = match lang {
+            Lang::En => &self.typos_en,
+            Lang::Ru => &self.typos_ru,
+        };
+        if typos.is_empty() {
+            return None;
+        }
+        typos.get(&word.to_lowercase()).map(String::as_str)
     }
 
     fn words(&self, lang: Lang) -> &BTreeSet<String> {
@@ -70,6 +103,18 @@ impl UserData {
     }
 }
 
+/// `wrong right...` pairs, one per line; `#` starts a comment.
+pub fn parse_typo_list(text: &str) -> HashMap<String, String> {
+    text.lines()
+        .map(|line| line.split('#').next().unwrap_or("").trim())
+        .filter_map(|line| {
+            let (wrong, right) = line.split_once(char::is_whitespace)?;
+            let right = right.trim();
+            (!right.is_empty()).then(|| (wrong.to_lowercase(), right.to_string()))
+        })
+        .collect()
+}
+
 fn parse_word_list(text: &str) -> BTreeSet<String> {
     text.lines()
         .map(|line| line.split('#').next().unwrap_or("").trim())
@@ -86,6 +131,7 @@ mod tests {
         UserData {
             en: parse_word_list(en),
             ru: parse_word_list(ru),
+            ..UserData::default()
         }
     }
 
@@ -115,6 +161,14 @@ mod tests {
         assert!(!user.has_longer_word(Lang::En, "hyprland"));
         assert!(!user.has_longer_word(Lang::En, "wayb"));
         assert!(!user.has_longer_word(Lang::Ru, "hypr"));
+    }
+
+    #[test]
+    fn typo_lists_map_a_wrong_word_to_the_right_text() {
+        let typos = parse_typo_list("# mine\nTeh   the\nvobshem  в общем  # two words\njunk\n\n");
+        assert_eq!(typos.len(), 2);
+        assert_eq!(typos["teh"], "the");
+        assert_eq!(typos["vobshem"], "в общем");
     }
 
     #[test]
