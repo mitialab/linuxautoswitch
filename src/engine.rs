@@ -91,8 +91,44 @@ pub struct Status {
     pub excluded: bool,
 }
 
+/// Everything a correction does to the outside world, behind a trait so the
+/// order of those steps can be tested without a compositor or `wtype`.
+pub trait Io {
+    /// Switches `device` to the layout at `index` in its `kb_layout` list.
+    fn switch_layout(&mut self, device: &str, index: u32) -> anyhow::Result<()>;
+    /// The layout name Hyprland currently reports for `device`, if known.
+    fn active_keymap(&mut self, device: &str) -> anyhow::Result<Option<String>>;
+    /// Deletes `backspaces` characters, then types `text`.
+    fn type_text(&mut self, backspaces: usize, text: &str, delay_ms: u64) -> anyhow::Result<()>;
+    fn sleep_ms(&mut self, ms: u64);
+}
+
+struct SystemIo;
+
+impl Io for SystemIo {
+    fn switch_layout(&mut self, device: &str, index: u32) -> anyhow::Result<()> {
+        hypr::switch_layout(device, index)
+    }
+
+    fn active_keymap(&mut self, device: &str) -> anyhow::Result<Option<String>> {
+        Ok(hypr::get_keyboards()?
+            .into_iter()
+            .find(|kb| kb.name == device)
+            .map(|kb| kb.active_keymap))
+    }
+
+    fn type_text(&mut self, backspaces: usize, text: &str, delay_ms: u64) -> anyhow::Result<()> {
+        typer::correct_word(backspaces, text, delay_ms)
+    }
+
+    fn sleep_ms(&mut self, ms: u64) {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
 pub struct Engine {
     cfg: Config,
+    io: Box<dyn Io>,
     buffer: Vec<TypedKey>,
     /// Set once the current word runs past `MAX_WORD_KEYS`.
     overflowed: bool,
@@ -147,7 +183,11 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(mut cfg: Config) -> Self {
+    pub fn new(cfg: Config) -> Self {
+        Self::with_io(cfg, Box::new(SystemIo))
+    }
+
+    fn with_io(mut cfg: Config, io: Box<dyn Io>) -> Self {
         // Lowercase every case-insensitive matcher once up front so the
         // comparisons below don't allocate.
         for list in [
@@ -180,6 +220,7 @@ impl Engine {
 
         let mut engine = Self {
             cfg,
+            io,
             buffer: Vec::new(),
             overflowed: false,
             manually_flipped: false,
@@ -535,13 +576,18 @@ impl Engine {
         let keys_snapshot = self.buffer.clone();
         let trailing_spaces = boundary.chars().count();
         let backspaces = self.buffer.len() + trailing_spaces;
-        if let Err(e) = typer::correct_word(backspaces, &format!("{corrected}{boundary}")) {
-            tracing::warn!("failed to retype corrected word: {e:#}");
+        if !self.replace_and_switch(
+            device_name.as_deref(),
+            current_lang,
+            other_lang,
+            backspaces,
+            &format!("{corrected}{boundary}"),
+        ) {
             return false;
         }
         // Whatever was typed is gone now regardless of whether the layout
-        // switch below succeeds - don't let a stale buffer trigger another
-        // correction on top of this one.
+        // switch took - don't let a stale buffer trigger another correction
+        // on top of this one.
         self.reset_word();
         // The word now on screen is in `other_lang` - if it's still wrong
         // (a name that happened to also look wrong in the dictionary's
@@ -551,27 +597,108 @@ impl Engine {
             lang_on_screen: other_lang,
             trailing_spaces,
         });
+        true
+    }
 
-        match device_name {
-            Some(device_name) => {
-                let index = match other_lang {
-                    Lang::En => self.cfg.layouts.english_index,
-                    Lang::Ru => self.cfg.layouts.russian_index,
-                };
-                match hypr::switch_layout(&device_name, index) {
-                    Ok(()) => {
-                        self.device_lang.insert(device_name, other_lang);
-                        self.last_lang = Some(other_lang);
-                    }
-                    Err(e) => tracing::warn!("failed to switch layout: {e:#}"),
+    /// The one place a correction touches the outside world: makes `target`
+    /// the active layout and replaces `backspaces` characters before the
+    /// cursor with `text`. Returns whether the text was typed.
+    ///
+    /// The layout is switched *first*, in one fast socket call. The daemon
+    /// can only read keys, not hold them back, so anything typed while the
+    /// correction runs lands in the application before the correction does;
+    /// switching first at least makes those keys come out in the new layout.
+    /// The text is typed through `wtype`'s own keymap, so it doesn't depend on
+    /// the switch. Afterwards the layout is read back and the switch repeated
+    /// if it didn't take (see `Timing`).
+    fn replace_and_switch(
+        &mut self,
+        device: Option<&str>,
+        current: Lang,
+        target: Lang,
+        backspaces: usize,
+        text: &str,
+    ) -> bool {
+        let timing = self.cfg.timing.clone();
+        let switched = match device {
+            Some(device) => match self.io.switch_layout(device, self.layout_index(target)) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("failed to switch layout: {e:#}");
+                    false
+                }
+            },
+            None => {
+                tracing::warn!(
+                    "could not resolve a hyprland keyboard device; \
+                     set `hypr.device_name_override` in the config"
+                );
+                false
+            }
+        };
+        if switched && timing.delay_after_layout_switch_ms > 0 {
+            self.io.sleep_ms(timing.delay_after_layout_switch_ms);
+        }
+
+        if let Err(e) = self
+            .io
+            .type_text(backspaces, text, timing.delay_before_retype_ms)
+        {
+            tracing::warn!("failed to retype corrected word: {e:#}");
+            if switched && let Some(device) = device {
+                // Don't leave the layout switched with the text untouched.
+                if let Err(e) = self.io.switch_layout(device, self.layout_index(current)) {
+                    tracing::warn!("failed to switch the layout back: {e:#}");
                 }
             }
-            None => tracing::warn!(
-                "could not resolve a hyprland keyboard device for '{source_device}'; \
-                 set `hypr.device_name_override` in the config"
-            ),
+            return false;
+        }
+
+        if switched && let Some(device) = device {
+            self.confirm_layout(device, target);
         }
         true
+    }
+
+    fn layout_index(&self, lang: Lang) -> u32 {
+        match lang {
+            Lang::En => self.cfg.layouts.english_index,
+            Lang::Ru => self.cfg.layouts.russian_index,
+        }
+    }
+
+    /// Reads the layout back from Hyprland and repeats the switch while it
+    /// differs from `target`, up to `timing.layout_switch_retries` times.
+    /// When the layout can't be read at all the switch is trusted, as it was
+    /// before verification existed.
+    fn confirm_layout(&mut self, device: &str, target: Lang) {
+        let mut attempt = 0;
+        loop {
+            let reported = match self.io.active_keymap(device) {
+                Ok(Some(keymap)) => detect_lang(&keymap, &self.cfg),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::debug!("could not read the active layout back: {e:#}");
+                    None
+                }
+            };
+            if reported.is_none() || reported == Some(target) {
+                self.device_lang.insert(device.to_string(), target);
+                self.last_lang = Some(target);
+                return;
+            }
+            if attempt >= self.cfg.timing.layout_switch_retries {
+                tracing::warn!(?target, ?reported, "layout did not switch after retrying");
+                return;
+            }
+            attempt += 1;
+            tracing::debug!(attempt, "layout not switched yet, retrying");
+            self.io
+                .sleep_ms(self.cfg.timing.layout_switch_retry_delay_ms);
+            if let Err(e) = self.io.switch_layout(device, self.layout_index(target)) {
+                tracing::warn!("failed to switch layout: {e:#}");
+            }
+        }
     }
 
     fn lang_for_device(&self, device_name: Option<&str>) -> Option<Lang> {
@@ -671,29 +798,15 @@ impl Engine {
         tracing::info!(to = %corrected, ?target_lang, "manually flipping word");
 
         let text = corrected + &" ".repeat(trailing_spaces);
-        if let Err(e) = typer::correct_word(keys.len() + trailing_spaces, &text) {
-            tracing::warn!("failed to retype flipped word: {e:#}");
+        let device_name = self.resolve_hypr_device_name(source_device);
+        if !self.replace_and_switch(
+            device_name.as_deref(),
+            on_screen_lang,
+            target_lang,
+            keys.len() + trailing_spaces,
+            &text,
+        ) {
             return None;
-        }
-
-        match self.resolve_hypr_device_name(source_device) {
-            Some(device_name) => {
-                let index = match target_lang {
-                    Lang::En => self.cfg.layouts.english_index,
-                    Lang::Ru => self.cfg.layouts.russian_index,
-                };
-                match hypr::switch_layout(&device_name, index) {
-                    Ok(()) => {
-                        self.device_lang.insert(device_name, target_lang);
-                        self.last_lang = Some(target_lang);
-                    }
-                    Err(e) => tracing::warn!("failed to switch layout: {e:#}"),
-                }
-            }
-            None => tracing::warn!(
-                "could not resolve a hyprland keyboard device for '{source_device}'; \
-                 set `hypr.device_name_override` in the config"
-            ),
         }
         Some(target_lang)
     }
@@ -1314,6 +1427,183 @@ mod tests {
         // One more Backspace deletes into the word itself.
         tap(&mut engine, KeyCode::KEY_BACKSPACE);
         assert!(engine.last_word.is_none());
+    }
+
+    /// Records every outside-world step of a correction, in order, and plays
+    /// back scripted answers for the layout read-back.
+    #[derive(Default)]
+    struct Script {
+        calls: Vec<String>,
+        keymaps: std::collections::VecDeque<anyhow::Result<Option<String>>>,
+        fail_type: bool,
+    }
+
+    struct FakeIo(std::rc::Rc<std::cell::RefCell<Script>>);
+
+    impl Io for FakeIo {
+        fn switch_layout(&mut self, device: &str, index: u32) -> anyhow::Result<()> {
+            self.0
+                .borrow_mut()
+                .calls
+                .push(format!("switch {device} {index}"));
+            Ok(())
+        }
+
+        fn active_keymap(&mut self, device: &str) -> anyhow::Result<Option<String>> {
+            let mut script = self.0.borrow_mut();
+            script.calls.push(format!("read {device}"));
+            script
+                .keymaps
+                .pop_front()
+                .unwrap_or_else(|| Ok(Some("Russian".to_string())))
+        }
+
+        fn type_text(
+            &mut self,
+            backspaces: usize,
+            text: &str,
+            delay_ms: u64,
+        ) -> anyhow::Result<()> {
+            let mut script = self.0.borrow_mut();
+            script
+                .calls
+                .push(format!("type {backspaces} {text:?} {delay_ms}"));
+            if script.fail_type {
+                anyhow::bail!("wtype exited with 1");
+            }
+            Ok(())
+        }
+
+        fn sleep_ms(&mut self, ms: u64) {
+            self.0.borrow_mut().calls.push(format!("sleep {ms}"));
+        }
+    }
+
+    fn scripted_engine(
+        configure: impl FnOnce(&mut Config),
+    ) -> (Engine, std::rc::Rc<std::cell::RefCell<Script>>) {
+        let mut cfg = Config::default();
+        cfg.general.eager_correction = false;
+        cfg.hypr.device_name_override = Some("kbd0".to_string());
+        configure(&mut cfg);
+        let script = std::rc::Rc::new(std::cell::RefCell::new(Script::default()));
+        let mut engine = Engine::with_io(cfg, Box::new(FakeIo(script.clone())));
+        engine.last_lang = Some(Lang::En);
+        (engine, script)
+    }
+
+    fn type_privet_and_space(engine: &mut Engine) {
+        for code in PRIVET {
+            tap(engine, code);
+        }
+        tap(engine, KeyCode::KEY_SPACE);
+    }
+
+    fn english() -> anyhow::Result<Option<String>> {
+        Ok(Some("English (US)".to_string()))
+    }
+
+    #[test]
+    fn layout_is_switched_before_the_text_is_typed_then_verified() {
+        let (mut engine, script) = scripted_engine(|_| {});
+        type_privet_and_space(&mut engine);
+        assert_eq!(
+            script.borrow().calls,
+            ["switch kbd0 1", "type 7 \"привет \" 0", "read kbd0"]
+        );
+        assert_eq!(engine.last_lang, Some(Lang::Ru));
+    }
+
+    #[test]
+    fn switch_is_repeated_until_the_layout_reads_back() {
+        let (mut engine, script) = scripted_engine(|_| {});
+        script.borrow_mut().keymaps = [english(), english(), Ok(Some("Russian".into()))].into();
+        type_privet_and_space(&mut engine);
+        assert_eq!(
+            script.borrow().calls,
+            [
+                "switch kbd0 1",
+                "type 7 \"привет \" 0",
+                "read kbd0",
+                "sleep 50",
+                "switch kbd0 1",
+                "read kbd0",
+                "sleep 50",
+                "switch kbd0 1",
+                "read kbd0",
+            ]
+        );
+        assert_eq!(engine.last_lang, Some(Lang::Ru));
+    }
+
+    #[test]
+    fn gives_up_after_the_configured_retries_without_claiming_success() {
+        let (mut engine, script) = scripted_engine(|cfg| cfg.timing.layout_switch_retries = 1);
+        script.borrow_mut().keymaps = [english(), english(), english()].into();
+        type_privet_and_space(&mut engine);
+        let switches = script
+            .borrow()
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("switch"))
+            .count();
+        assert_eq!(switches, 2); // the first attempt plus one retry
+        // The layout never changed, so the engine mustn't pretend it did.
+        assert_eq!(engine.last_lang, Some(Lang::En));
+    }
+
+    #[test]
+    fn an_unreadable_layout_is_trusted_without_retrying() {
+        let (mut engine, script) = scripted_engine(|_| {});
+        script.borrow_mut().keymaps = [Err(anyhow::anyhow!("socket closed"))].into();
+        type_privet_and_space(&mut engine);
+        assert!(!script.borrow().calls.iter().any(|c| c.starts_with("sleep")));
+        assert_eq!(engine.last_lang, Some(Lang::Ru));
+    }
+
+    #[test]
+    fn failed_typing_puts_the_layout_back() {
+        let (mut engine, script) = scripted_engine(|_| {});
+        script.borrow_mut().fail_type = true;
+        type_privet_and_space(&mut engine);
+        assert_eq!(
+            script.borrow().calls,
+            ["switch kbd0 1", "type 7 \"привет \" 0", "switch kbd0 0"]
+        );
+        assert_eq!(engine.last_lang, Some(Lang::En));
+        // The text was left alone, so it is still what was typed - and still
+        // flippable by hand.
+        assert_eq!(engine.last_word.unwrap().lang_on_screen, Lang::En);
+    }
+
+    #[test]
+    fn configured_delays_are_applied_in_order() {
+        let (mut engine, script) = scripted_engine(|cfg| {
+            cfg.timing.delay_after_layout_switch_ms = 10;
+            cfg.timing.delay_before_retype_ms = 20;
+        });
+        type_privet_and_space(&mut engine);
+        assert_eq!(
+            script.borrow().calls,
+            [
+                "switch kbd0 1",
+                "sleep 10",
+                "type 7 \"привет \" 20",
+                "read kbd0"
+            ]
+        );
+    }
+
+    #[test]
+    fn manual_flip_goes_through_the_same_sequence() {
+        let (mut engine, script) = scripted_engine(|_| {});
+        let typed = keys(&PRIVET);
+        let flipped_to = engine.flip_and_retype(&typed, Lang::En, 1, "kbd");
+        assert_eq!(flipped_to, Some(Lang::Ru));
+        assert_eq!(
+            script.borrow().calls,
+            ["switch kbd0 1", "type 7 \"привет \" 0", "read kbd0"]
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub struct Config {
     pub layouts: Layouts,
     pub hypr: HyprCfg,
     pub hotkeys: Hotkeys,
+    pub timing: Timing,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -145,6 +146,37 @@ impl Default for Hotkeys {
     }
 }
 
+/// How a correction is carried out. The defaults wait for nothing: the daemon
+/// only reads keys, it cannot hold them back, so every millisecond spent
+/// waiting is a millisecond in which the next thing you type reaches the
+/// application first. Raise a delay only for an app that visibly loses the
+/// start of a retyped word.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct Timing {
+    /// Pause between switching the layout and typing the correction.
+    pub delay_after_layout_switch_ms: u64,
+    /// Pause between the Backspaces and the retyped word (inside one
+    /// `wtype` call). Helps slow apps that process deletions lazily.
+    pub delay_before_retype_ms: u64,
+    /// After retyping, the active layout is read back from Hyprland; if it is
+    /// not the one asked for, the switch is repeated up to this many times.
+    pub layout_switch_retries: u32,
+    /// Wait before each repeated switch.
+    pub layout_switch_retry_delay_ms: u64,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            delay_after_layout_switch_ms: 0,
+            delay_before_retype_ms: 0,
+            layout_switch_retries: 2,
+            layout_switch_retry_delay_ms: 50,
+        }
+    }
+}
+
 pub fn default_path() -> PathBuf {
     let base = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -171,5 +203,39 @@ pub fn load(path: Option<PathBuf>) -> anyhow::Result<Config> {
             Ok(Config::default())
         }
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The example file is what `install.sh` copies for new users, so its
+    /// values must be the built-in defaults - otherwise the documented
+    /// behavior and the behavior without a config file quietly diverge.
+    #[test]
+    fn example_config_matches_the_built_in_defaults() {
+        let example: Config = toml::from_str(include_str!("../assets/config.example.toml"))
+            .expect("assets/config.example.toml parses");
+        let default = Config::default();
+        assert_eq!(
+            example.general.reset_on_click,
+            default.general.reset_on_click
+        );
+        assert_eq!(
+            example.general.eager_min_word_length,
+            default.general.eager_min_word_length
+        );
+        let (a, b) = (&example.timing, &default.timing);
+        assert_eq!(
+            a.delay_after_layout_switch_ms,
+            b.delay_after_layout_switch_ms
+        );
+        assert_eq!(a.delay_before_retype_ms, b.delay_before_retype_ms);
+        assert_eq!(a.layout_switch_retries, b.layout_switch_retries);
+        assert_eq!(
+            a.layout_switch_retry_delay_ms,
+            b.layout_switch_retry_delay_ms
+        );
     }
 }

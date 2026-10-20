@@ -43,11 +43,13 @@ word is retyped.
    punctuation, arrows) just reset the word-tracking state without
    rechecking it, since the eager check already had every chance to catch
    it and by then the app has typically already acted on that key anyway.
-3. If so: delete what was typed (plus the space, if a space triggered the
-   check), switch the active layout via Hyprland's
-   `switchxkblayout`, and retype the corrected word - via Wayland's virtual
-   keyboard protocol (`wtype`), so it never sees its own corrections as new
-   input.
+3. If so: switch the active layout via Hyprland's `switchxkblayout` (first,
+   so anything you type while the fix runs already comes out in the right
+   layout), delete what was typed (plus the space, if a space triggered the
+   check), and retype the corrected word - via Wayland's virtual keyboard
+   protocol (`wtype`), so it never sees its own corrections as new input.
+   Afterwards the layout is read back from Hyprland and the switch repeated
+   if it didn't take; if typing itself fails, the layout is put back.
 4. Automatic detection only fires when it can find the word in one
    dictionary but not the other - names, jargon, and anything not in either
    dictionary go untouched. For those, a manual hotkey (default:
@@ -155,6 +157,14 @@ Key settings:
   Touchpad touches count too, since tap-to-click is synthesized by libinput
   and never appears as a real button on the raw device; the price is that a
   resting palm can cost a missed correction mid-word, never a wrong one.
+- `timing.*` - how a correction is carried out: the layout is switched
+  first, the fix typed next, the layout read back last and re-switched up to
+  `layout_switch_retries` times (default 2, `layout_switch_retry_delay_ms`
+  apart) if it didn't take. `delay_after_layout_switch_ms` and
+  `delay_before_retype_ms` default to 0 on purpose - the daemon can't hold
+  your keys back, so any wait only lets what you type next reach the app
+  ahead of the fix - and exist for apps that visibly lose the start of a
+  retyped word.
 - `layouts.english_index` / `russian_index` - must match the order of
   `kb_layout` in your Hyprland config (e.g. `kb_layout = us,ru` means
   `english_index = 0`, `russian_index = 1`)

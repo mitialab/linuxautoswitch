@@ -98,3 +98,22 @@ manual_correct_window_ms = 400
 # already paused or on an excluded window - it's the way out. Same effect
 # as `linuxautoswitch toggle` from a shell.
 toggle_pause_keys = ["leftshift", "rightshift"]
+
+[timing]
+# How a correction is carried out. The layout is switched first, then the
+# fix is typed, then the layout is read back from Hyprland. The delays default
+# to 0 on purpose: the daemon only reads your keys, it cannot hold them back,
+# so every millisecond spent waiting is time in which what you type next
+# reaches the application ahead of the fix. Raise one only for an app that
+# visibly loses the start of a retyped word.
+
+# Pause between switching the layout and typing the fix.
+delay_after_layout_switch_ms = 0
+
+# Pause between the Backspaces and the retyped word.
+delay_before_retype_ms = 0
+
+# If the layout read back isn't the one asked for, repeat the switch this
+# many times (0 = never repeat), waiting this long before each repeat.
+layout_switch_retries = 2
+layout_switch_retry_delay_ms = 50
