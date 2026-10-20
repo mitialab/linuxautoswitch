@@ -39,9 +39,9 @@ pub struct General {
     /// word boundaries (space/enter/tab/...). Needed for text that's acted
     /// on without ever hitting a boundary key, e.g. a browser address bar
     /// where you type a URL and immediately press Enter, or click a
-    /// suggestion. May very occasionally fire a beat early, mid-word, if a
-    /// partial word you're still typing happens to coincidentally spell a
-    /// real word in the other language - see README.
+    /// suggestion. Holds back while the typed text is the start of a longer
+    /// word in the active layout, so a half-typed word isn't mistaken for a
+    /// whole word in the other language - see README.
     pub eager_correction: bool,
     /// Minimum length for an eager (mid-word) correction. Kept higher than
     /// `min_word_length` by default since short coincidental matches are

@@ -41,9 +41,9 @@ exclude_steam_games = true
 # Check for a correction after every keystroke instead of only at word
 # boundaries (space/enter/tab/...). Needed for e.g. a browser address bar,
 # where you type a URL and press Enter immediately rather than a space.
-# Can very occasionally fire a beat early on a partial word that
-# coincidentally spells a real word in the other language - see the
-# README's "Known limitations" section.
+# A mid-word check holds back while what you typed is the start of a longer
+# word in the active layout (it is probably still being typed); the Space
+# check still covers it. See the README's "Known limitations" section.
 eager_correction = true
 
 # Minimum length for an eager (mid-word) correction. Kept higher than

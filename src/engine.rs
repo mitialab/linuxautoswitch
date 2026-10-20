@@ -351,7 +351,12 @@ impl Engine {
             // acted on it. This way the word is usually already fixed
             // before that happens.
             if self.cfg.general.eager_correction && !self.manually_flipped {
-                self.try_correct(source_device, "", self.cfg.general.eager_min_word_length);
+                self.try_correct(
+                    source_device,
+                    "",
+                    self.cfg.general.eager_min_word_length,
+                    true,
+                );
             }
             return;
         }
@@ -374,7 +379,7 @@ impl Engine {
         } else if !is_space || self.overflowed {
             self.last_word = None;
         } else if self.manually_flipped
-            || !self.try_correct(source_device, " ", self.cfg.general.min_word_length)
+            || !self.try_correct(source_device, " ", self.cfg.general.min_word_length, false)
         {
             // Not corrected - the word was fine, too short to check, or not
             // recognized in either language. Keep it anyway: this is exactly
@@ -462,7 +467,13 @@ impl Engine {
     /// correction was made; only then is the buffer cleared, since a caller
     /// still mid-word (the eager path) needs to keep accumulating
     /// otherwise.
-    fn try_correct(&mut self, source_device: &str, boundary: &str, min_length: usize) -> bool {
+    fn try_correct(
+        &mut self,
+        source_device: &str,
+        boundary: &str,
+        min_length: usize,
+        eager: bool,
+    ) -> bool {
         // Each key yields at most one letter, so a buffer shorter than the
         // minimum can't qualify. Checked first because eager correction runs
         // this on every keystroke.
@@ -477,7 +488,7 @@ impl Engine {
         };
 
         let other_lang = current_lang.other();
-        let Some(corrected) = correction(&self.buffer, current_lang, min_length) else {
+        let Some(corrected) = correction(&self.buffer, current_lang, min_length, eager) else {
             return false;
         };
 
@@ -738,7 +749,12 @@ const MIN_CORRECTION_LENGTH: usize = 2;
 
 /// The text `keys` should be replaced with if they were typed in the wrong
 /// layout (`current_lang` being the active one), or `None` to leave them.
-fn correction(keys: &[TypedKey], current_lang: Lang, min_word_length: usize) -> Option<String> {
+fn correction(
+    keys: &[TypedKey],
+    current_lang: Lang,
+    min_word_length: usize,
+    eager: bool,
+) -> Option<String> {
     let min_word_length = min_word_length.max(MIN_CORRECTION_LENGTH);
     let en_word: String = keys
         .iter()
@@ -774,6 +790,14 @@ fn correction(keys: &[TypedKey], current_lang: Lang, min_word_length: usize) -> 
     // unrecognized word in both dictionaries is far more likely to be a
     // name, a command, or a typo than a layout mistake.
     if !dictionary::contains(other_lang, other_core) {
+        return None;
+    }
+    // Mid-word (eager) only: the text typed so far isn't a word, but it is
+    // the start of one in the layout that is actually active, so the person
+    // is most likely still typing it. Wait for more keys; the Space check
+    // still covers the case where they really did type the wrong layout.
+    if eager && dictionary::has_longer_word(current_lang, typed_core) {
+        tracing::debug!(typed = %typed_word, "not correcting yet: may be a word still being typed");
         return None;
     }
 
@@ -879,7 +903,7 @@ mod tests {
     #[test]
     fn corrects_word_typed_in_wrong_layout() {
         assert_eq!(
-            correction(&keys(&PRIVET), Lang::En, 3).as_deref(),
+            correction(&keys(&PRIVET), Lang::En, 3, false).as_deref(),
             Some("привет")
         );
     }
@@ -890,7 +914,7 @@ mod tests {
         let mut codes = PRIVET.to_vec();
         codes.push(KeyCode::KEY_SLASH);
         assert_eq!(
-            correction(&keys(&codes), Lang::En, 3).as_deref(),
+            correction(&keys(&codes), Lang::En, 3, false).as_deref(),
             Some("привет.")
         );
     }
@@ -906,7 +930,7 @@ mod tests {
             KeyCode::KEY_O,
             KeyCode::KEY_COMMA,
         ];
-        assert_eq!(correction(&keys(&codes), Lang::En, 3), None);
+        assert_eq!(correction(&keys(&codes), Lang::En, 3, false), None);
     }
 
     #[test]
@@ -925,8 +949,37 @@ mod tests {
             KeyCode::KEY_E,
         ];
         assert_eq!(
-            correction(&keys(&codes), Lang::Ru, 3).as_deref(),
+            correction(&keys(&codes), Lang::Ru, 3, false).as_deref(),
             Some("google")
+        );
+    }
+
+    #[test]
+    fn partial_word_in_active_layout_is_not_corrected_eagerly() {
+        // "blen" (the start of "blend") is "идут" on the Russian layout, a
+        // real Russian word - but someone typing on the English layout is
+        // far more likely to be halfway through "blend".
+        let codes = [
+            KeyCode::KEY_B,
+            KeyCode::KEY_L,
+            KeyCode::KEY_E,
+            KeyCode::KEY_N,
+        ];
+        assert_eq!(correction(&keys(&codes), Lang::En, 4, true), None);
+        // Once the word is confirmed finished (Space), it is judged as before.
+        assert_eq!(
+            correction(&keys(&codes), Lang::En, 4, false).as_deref(),
+            Some("идут")
+        );
+    }
+
+    #[test]
+    fn wrong_layout_word_is_still_corrected_eagerly() {
+        // "ghbdtn" is not the start of any English word, so nothing holds it
+        // back.
+        assert_eq!(
+            correction(&keys(&PRIVET), Lang::En, 4, true).as_deref(),
+            Some("привет")
         );
     }
 
@@ -938,7 +991,7 @@ mod tests {
         // complete, so even a 2-letter word like this can be trusted.
         let codes = [KeyCode::KEY_J, KeyCode::KEY_Y];
         assert_eq!(
-            correction(&keys(&codes), Lang::En, 2).as_deref(),
+            correction(&keys(&codes), Lang::En, 2, false).as_deref(),
             Some("он")
         );
     }
@@ -950,13 +1003,13 @@ mod tests {
         // complete short word from the first two letters of a longer one,
         // so eager checking should hold off.
         let codes = [KeyCode::KEY_J, KeyCode::KEY_Y];
-        assert_eq!(correction(&keys(&codes), Lang::En, 4), None);
+        assert_eq!(correction(&keys(&codes), Lang::En, 4, false), None);
     }
 
     #[test]
     fn single_letter_is_never_corrected_even_if_configured_to() {
         let codes = [KeyCode::KEY_J];
-        assert_eq!(correction(&keys(&codes), Lang::En, 1), None);
+        assert_eq!(correction(&keys(&codes), Lang::En, 1, false), None);
     }
 
     #[test]

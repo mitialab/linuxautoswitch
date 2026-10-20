@@ -269,17 +269,19 @@ and reference `"custom/linuxautoswitch"` in one of the bar's module lists.
   auto-detection guesses the wrong device.
 - No per-application layout memory (Caramba's other headline feature) - this
   focuses purely on wrong-layout typo correction. Could be added later.
-- With `eager_correction` on, a correction can very occasionally fire a beat
-  early, mid-word: if a partial word you're still typing happens to
-  coincidentally spell a complete real word in the other language, it gets
-  corrected right then rather than once you finish typing. In practice this
-  is self-correcting (the layout gets switched either way, so the rest of
-  the word still comes out right) unless the coincidence happens to be a
-  real word in the *other* language while you're still mid-word in the
-  *currently active* one - rare, but possible with a 1.5M-entry Russian
-  dictionary. Raise `eager_min_word_length`, or turn `eager_correction` off
-  to fall back to boundary-only correction, if this happens often enough to
-  bother you.
+- With `eager_correction` on, a mid-word check holds back while the text you
+  have typed is not a word in the active layout but *is* the start of a
+  longer one (typing `blen` on the English layout, on the way to `blend`,
+  would otherwise read as the Russian word `идут`). Measured against the
+  bundled dictionaries this affects roughly 180 English and 60 Russian
+  prefixes in each direction, and costs about 0.01-0.02% of words their eager
+  correction: they are still corrected when you press Space, just not before
+  an Enter pressed straight after the word. A correction can still fire a
+  beat early the other way round - a partial word on the wrong layout that
+  already spells a complete word - which is self-correcting, since the layout
+  is switched either way. Raise `eager_min_word_length`, or turn
+  `eager_correction` off to fall back to boundary-only correction, if this
+  bothers you.
 - The manual-flip hotkey only reaches back to the last word while the
   cursor is still right after it (plus any spaces). After Enter, Tab,
   punctuation, an arrow key or a focus change there's nothing to flip.
