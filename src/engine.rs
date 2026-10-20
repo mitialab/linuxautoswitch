@@ -499,12 +499,12 @@ impl Engine {
             // the case the manual flip hotkey exists for.
             let device_name = self.resolve_hypr_device_name(source_device);
             let lang = self.lang_for_device(device_name.as_deref());
-            if let Some(lang) = lang
-                && !self.manually_flipped
-            {
-                self.fix_finished_word(lang);
-            }
-            self.last_word = lang.map(|lang| LastWord {
+            let rewritten =
+                lang.is_some_and(|lang| !self.manually_flipped && self.fix_finished_word(lang));
+            // A rewritten word no longer matches the keys it was typed with
+            // (a typo fix can change its length), so a hand flip would delete
+            // the wrong amount of text: it can't be flipped.
+            self.last_word = lang.filter(|_| !rewritten).map(|lang| LastWord {
                 keys: self.buffer.clone(),
                 lang_on_screen: lang,
                 trailing_spaces: 1,
@@ -664,14 +664,15 @@ impl Engine {
 
     /// A word just ended with Space and needed no layout correction: apply
     /// the opt-in fixes that rewrite it in place (see `textfix`). `lang` is
-    /// the layout it was typed in; nothing is switched.
-    fn fix_finished_word(&mut self, lang: Lang) {
+    /// the layout it was typed in; nothing is switched. Returns whether the
+    /// word on screen was changed.
+    fn fix_finished_word(&mut self, lang: Lang) -> bool {
         if self.overflowed || self.password_token {
-            return;
+            return false;
         }
         let text = on_screen_text(&self.buffer, lang);
         let Some(fixed) = textfix::fix_word(&text, lang, &self.cfg.experimental, &self.user) else {
-            return;
+            return false;
         };
         tracing::info!(from = %text, to = %fixed, "fixing finished word");
         // The word and the Space that ended it.
@@ -680,7 +681,9 @@ impl Engine {
             .type_text(self.buffer.len() + 1, &format!("{fixed} "), 0)
         {
             tracing::warn!("failed to retype fixed word: {e:#}");
+            return false;
         }
+        true
     }
 
     /// The one place a correction touches the outside world: makes `target`
@@ -1937,7 +1940,8 @@ mod tests {
         tap(&mut engine, KeyCode::KEY_SPACE);
         // 5 letters + the Space, retyped with the second capital lowered.
         assert_eq!(script.borrow().calls, ["type 6 \"Hello \" 0"]);
-        assert_eq!(engine.last_word.unwrap().lang_on_screen, Lang::En);
+        // What is on screen no longer matches the keys, so no hand flip.
+        assert!(engine.last_word.is_none());
     }
 
     #[test]
@@ -1970,6 +1974,61 @@ mod tests {
         }
         tap(&mut engine, KeyCode::KEY_SPACE);
         assert!(script.borrow().calls.is_empty());
+    }
+
+    #[test]
+    fn a_rewritten_word_cannot_be_flipped_by_hand() {
+        // "comming" -> "coming" is one character shorter on screen than the
+        // keys that were typed, so a flip would delete the wrong amount.
+        let (mut engine, script) = scripted_engine(|cfg| cfg.experimental.typo_correction = true);
+        for code in [
+            KeyCode::KEY_C,
+            KeyCode::KEY_O,
+            KeyCode::KEY_M,
+            KeyCode::KEY_M,
+            KeyCode::KEY_I,
+            KeyCode::KEY_N,
+            KeyCode::KEY_G,
+        ] {
+            tap(&mut engine, code);
+        }
+        tap(&mut engine, KeyCode::KEY_SPACE);
+        assert_eq!(script.borrow().calls, ["type 8 \"coming \" 0"]);
+        double_tap_shift(&mut engine);
+        assert_eq!(
+            script.borrow().calls.len(),
+            1,
+            "{:?}",
+            script.borrow().calls
+        );
+    }
+
+    #[test]
+    fn capitalized_russian_word_is_still_corrected_with_the_password_guard_on() {
+        // "Пожалуйста" typed on the English layout is "Gj;fkeqcnf": a capital,
+        // lowercase letters and a ";" - which is "ж" on the Russian layout, not a
+        // symbol, so this must not be mistaken for a password.
+        let (mut engine, script) = scripted_engine(|cfg| cfg.experimental.password_guard = true);
+        type_with_shift(
+            &mut engine,
+            &[
+                (KeyCode::KEY_G, true),
+                (KeyCode::KEY_J, false),
+                (KeyCode::KEY_SEMICOLON, false),
+                (KeyCode::KEY_F, false),
+                (KeyCode::KEY_K, false),
+                (KeyCode::KEY_E, false),
+                (KeyCode::KEY_Q, false),
+                (KeyCode::KEY_C, false),
+                (KeyCode::KEY_N, false),
+                (KeyCode::KEY_F, false),
+            ],
+        );
+        tap(&mut engine, KeyCode::KEY_SPACE);
+        assert_eq!(
+            script.borrow().calls,
+            ["switch kbd0 1", "type 11 \"Пожалуйста \" 0", "read kbd0"]
+        );
     }
 
     #[test]

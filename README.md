@@ -221,7 +221,8 @@ Off by default; switch one on in the `[experimental]` table of `config.toml`
   a digit or symbol. It guesses from the shape of the text, since Wayland
   doesn't say which field has focus, and the first six or so keys are typed
   before it qualifies - it doesn't replace listing a password manager in
-  `excluded_classes`.
+  `excluded_classes`. The keys `[ ] ; ' , . \`` don't count as symbols, because
+  they are letters on the Russian layout (`Gj;fkeqcnf` is `Пожалуйста`).
 - `double_caps_fix` - when Space ends a word, lower the second of two leading
   capitals: `ПРивет` -> `Привет`, `HEllo` -> `Hello`. Only for exactly two
   capitals followed by at least two lowercase letters (four letters in all)

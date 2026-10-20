@@ -127,7 +127,8 @@ layout_switch_retry_delay_ms = 50
 # symbol. It guesses from the shape of the text (Wayland doesn't say which
 # field has focus), and the first six or so keys of a password are typed
 # before it qualifies, so it doesn't replace excluding a password manager's
-# window in excluded_classes.
+# window in excluded_classes. The keys [ ] ; ' , . ` don't count as symbols:
+# they are letters on the Russian layout ("Gj;fkeqcnf" is "Пожалуйста").
 password_guard = false
 
 # Fix two leading capitals when you finish a word with Space:

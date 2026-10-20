@@ -102,23 +102,15 @@ fn is_keypad_digit(code: KeyCode) -> bool {
     )
 }
 
-/// Punctuation keys. On the Russian layout several of these are letters, but
-/// a password is typed on the English one, so for this purpose they are
-/// symbols.
+/// Punctuation keys that are never letters. `[ ] ; ' , . \``are left out on
+/// purpose: on the Russian layout they are х ъ ж э б ю ё, so counting them as
+/// symbols would make a capitalized Russian word typed on the wrong layout
+/// ("Gj;fkeqcnf" is "Пожалуйста") look like a password and never be fixed.
+/// The cost is a password whose only symbols are those keys goes unnoticed.
 fn is_symbol_key(code: KeyCode) -> bool {
     matches!(
         code,
-        KeyCode::KEY_MINUS
-            | KeyCode::KEY_EQUAL
-            | KeyCode::KEY_BACKSLASH
-            | KeyCode::KEY_LEFTBRACE
-            | KeyCode::KEY_RIGHTBRACE
-            | KeyCode::KEY_SEMICOLON
-            | KeyCode::KEY_APOSTROPHE
-            | KeyCode::KEY_GRAVE
-            | KeyCode::KEY_COMMA
-            | KeyCode::KEY_DOT
-            | KeyCode::KEY_SLASH
+        KeyCode::KEY_MINUS | KeyCode::KEY_EQUAL | KeyCode::KEY_BACKSLASH | KeyCode::KEY_SLASH
     )
 }
 
@@ -217,6 +209,29 @@ mod tests {
         assert!(!stats.looks_like_password()); // back to six keys
         stats.push(KeyCode::KEY_X, false, false);
         assert!(stats.looks_like_password());
+    }
+
+    #[test]
+    fn keys_that_are_russian_letters_are_not_symbols() {
+        // "Gj;fkeqcnf" = "Пожалуйста" on the wrong layout: no digit, no real
+        // symbol, so not a password.
+        let word: Vec<(KeyCode, bool)> = vec![
+            (KeyCode::KEY_G, true),
+            (KeyCode::KEY_J, false),
+            (KeyCode::KEY_SEMICOLON, false),
+            (KeyCode::KEY_F, false),
+            (KeyCode::KEY_K, false),
+            (KeyCode::KEY_E, false),
+            (KeyCode::KEY_Q, false),
+            (KeyCode::KEY_C, false),
+            (KeyCode::KEY_N, false),
+            (KeyCode::KEY_F, false),
+        ];
+        assert!(!typed(&word).looks_like_password());
+        // A symbol that is the same in both layouts still counts.
+        let mut with_dash = word;
+        with_dash.push((KeyCode::KEY_MINUS, false));
+        assert!(typed(&with_dash).looks_like_password());
     }
 
     #[test]
