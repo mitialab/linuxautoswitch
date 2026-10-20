@@ -1001,7 +1001,11 @@ mod tests {
 
     #[test]
     fn autorepeat_backspace_keeps_deleting() {
-        let mut engine = Engine::new(Config::default());
+        // "ghbd" is "прив" on the Russian layout, a dictionary word, so eager
+        // correction would fire on the 4th key and empty the buffer.
+        let mut cfg = Config::default();
+        cfg.general.eager_correction = false;
+        let mut engine = Engine::new(cfg);
         for code in [
             KeyCode::KEY_G,
             KeyCode::KEY_H,
