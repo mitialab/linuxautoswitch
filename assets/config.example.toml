@@ -52,6 +52,15 @@ eager_correction = true
 # typed - not enough to trust yet.
 eager_min_word_length = 4
 
+# Also listen to mice, touchpads and touchscreens - button presses only, never
+# movement - so a click, which moves the cursor away from the word you were
+# typing, drops that word instead of letting a later correction delete text
+# at the wrong place. Set to false if you'd rather the daemon open keyboards
+# only. A touchpad touch counts too (tap-to-click never shows up as a real
+# button on the raw device), so a palm resting on the pad can occasionally
+# cost you a missed correction mid-word - never a wrong one.
+reset_on_click = true
+
 [layouts]
 # Substrings (case-insensitive) matched against Hyprland's `active_keymap`
 # description (see `hyprctl devices`) to recognize each layout.

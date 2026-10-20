@@ -149,6 +149,12 @@ Key settings:
   (`eager_min_word_length`, default 4) since a short one might just be the
   first letters of something longer. Single-letter words are never
   corrected, regardless of either setting.
+- `general.reset_on_click` - also watch mice, touchpads and touchscreens
+  (button presses only, never movement) and forget the word being typed on
+  every click, because a click moves the cursor away from it (on by default).
+  Touchpad touches count too, since tap-to-click is synthesized by libinput
+  and never appears as a real button on the raw device; the price is that a
+  resting palm can cost a missed correction mid-word, never a wrong one.
 - `layouts.english_index` / `russian_index` - must match the order of
   `kb_layout` in your Hyprland config (e.g. `kb_layout = us,ru` means
   `english_index = 0`, `russian_index = 1`)
@@ -282,6 +288,10 @@ and reference `"custom/linuxautoswitch"` in one of the bar's module lists.
   is switched either way. Raise `eager_min_word_length`, or turn
   `eager_correction` off to fall back to boundary-only correction, if this
   bothers you.
+- Cursor moves made without a click (keyboard shortcuts are already
+  handled; a touchscreen swipe, a pen, an app moving the caret itself) aren't
+  seen, so a word typed right before one can still be retyped in the wrong
+  place. Clicks are covered by `general.reset_on_click`.
 - The manual-flip hotkey only reaches back to the last word while the
   cursor is still right after it (plus any spaces). After Enter, Tab,
   punctuation, an arrow key or a focus change there's nothing to flip.

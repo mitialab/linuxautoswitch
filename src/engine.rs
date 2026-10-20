@@ -57,6 +57,25 @@ fn modifier_bit(code: KeyCode) -> Option<u8> {
     })
 }
 
+/// Buttons of a mouse, touchpad or touchscreen. A press moves the cursor
+/// without a key being typed, so the word being tracked is no longer where
+/// the cursor is. `BTN_TOUCH` also covers a touchpad tap-to-click, which
+/// libinput synthesizes and never shows up as `BTN_LEFT` on the raw device.
+pub fn is_pointer_button(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::BTN_LEFT
+            | KeyCode::BTN_RIGHT
+            | KeyCode::BTN_MIDDLE
+            | KeyCode::BTN_SIDE
+            | KeyCode::BTN_EXTRA
+            | KeyCode::BTN_FORWARD
+            | KeyCode::BTN_BACK
+            | KeyCode::BTN_TASK
+            | KeyCode::BTN_TOUCH
+    )
+}
+
 /// Longest run of word keys still treated as a word. Anything longer is
 /// not a real word (or is text we can't safely retype), so the buffer
 /// stops growing and no correction is attempted until the next boundary.
@@ -275,6 +294,13 @@ impl Engine {
     /// Autorepeat is handled like a key-down: a held letter or Backspace
     /// keeps typing or deleting on screen, so the buffer has to follow it.
     pub fn handle_key(&mut self, source_device: &str, code: KeyCode, value: i32) {
+        if is_pointer_button(code) {
+            if value == 1 {
+                self.handle_click();
+            }
+            return;
+        }
+
         let held = value != 0;
 
         if value == 1 {
@@ -394,6 +420,20 @@ impl Engine {
                 });
         }
         self.reset_word();
+    }
+
+    /// A pointer button went down: the cursor may now be anywhere, so
+    /// neither the word being typed nor the last completed one can be
+    /// retyped safely, and a click between two Shift taps (or during the
+    /// pause chord) means they weren't a clean hotkey.
+    fn handle_click(&mut self) {
+        self.manual_tap_pending = false;
+        self.manual_correct_last_tap = None;
+        if self.modifiers & self.toggle_pause_mask != 0 {
+            self.toggle_pause_dirty = true;
+            self.toggle_pause_armed = false;
+        }
+        self.forget_words();
     }
 
     /// Hotkeys are clean taps and chords: they only count when no other key
@@ -1274,6 +1314,85 @@ mod tests {
         // One more Backspace deletes into the word itself.
         tap(&mut engine, KeyCode::KEY_BACKSPACE);
         assert!(engine.last_word.is_none());
+    }
+
+    #[test]
+    fn click_drops_the_word_being_typed() {
+        let mut cfg = Config::default();
+        cfg.general.eager_correction = false;
+        let mut engine = Engine::new(cfg);
+        engine.last_lang = Some(Lang::En);
+        for code in [KeyCode::KEY_G, KeyCode::KEY_H, KeyCode::KEY_B] {
+            tap(&mut engine, code);
+        }
+        assert_eq!(engine.buffer.len(), 3);
+        tap(&mut engine, KeyCode::BTN_LEFT);
+        assert!(engine.buffer.is_empty());
+    }
+
+    #[test]
+    fn click_drops_the_last_completed_word() {
+        let mut engine = Engine::new(Config::default());
+        engine.last_lang = Some(Lang::En);
+        for code in [KeyCode::KEY_Q, KeyCode::KEY_X, KeyCode::KEY_Z] {
+            tap(&mut engine, code);
+        }
+        tap(&mut engine, KeyCode::KEY_SPACE);
+        assert!(engine.last_word.is_some());
+        tap(&mut engine, KeyCode::BTN_RIGHT);
+        // Without this a double-Shift would flip text at the old position.
+        assert!(engine.last_word.is_none());
+    }
+
+    #[test]
+    fn button_release_alone_does_not_reset() {
+        let mut cfg = Config::default();
+        cfg.general.eager_correction = false;
+        let mut engine = Engine::new(cfg);
+        engine.last_lang = Some(Lang::En);
+        tap(&mut engine, KeyCode::KEY_Q);
+        engine.handle_key("mouse", KeyCode::BTN_LEFT, UP);
+        assert_eq!(engine.buffer.len(), 1);
+    }
+
+    #[test]
+    fn every_pointer_button_resets_and_keys_do_not() {
+        for code in [
+            KeyCode::BTN_LEFT,
+            KeyCode::BTN_RIGHT,
+            KeyCode::BTN_MIDDLE,
+            KeyCode::BTN_SIDE,
+            KeyCode::BTN_EXTRA,
+            KeyCode::BTN_TOUCH,
+        ] {
+            assert!(is_pointer_button(code), "{code:?}");
+        }
+        assert!(!is_pointer_button(KeyCode::KEY_A));
+        assert!(!is_pointer_button(KeyCode::KEY_LEFTSHIFT));
+    }
+
+    #[test]
+    fn click_between_two_shift_taps_is_not_a_double_tap() {
+        let mut engine = Engine::new(Config::default());
+        engine.last_lang = Some(Lang::En);
+        for code in [KeyCode::KEY_Q, KeyCode::KEY_X, KeyCode::KEY_Z] {
+            tap(&mut engine, code);
+        }
+        tap(&mut engine, KeyCode::KEY_LEFTSHIFT);
+        assert!(engine.manual_correct_last_tap.is_some());
+        tap(&mut engine, KeyCode::BTN_LEFT);
+        assert!(engine.manual_correct_last_tap.is_none());
+    }
+
+    #[test]
+    fn click_during_pause_chord_cancels_it() {
+        let mut engine = Engine::new(Config::default());
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, DOWN);
+        tap(&mut engine, KeyCode::BTN_LEFT);
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, UP);
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, UP);
+        assert!(!engine.paused);
     }
 
     #[test]

@@ -48,6 +48,11 @@ pub struct General {
     /// more likely, and a premature short correction is more disruptive
     /// than waiting a couple more keystrokes.
     pub eager_min_word_length: usize,
+    /// Also watch mice and touchpads, so that a click (which moves the
+    /// cursor somewhere the typed word no longer is) drops the word being
+    /// tracked instead of letting a later correction delete the wrong text.
+    /// Only button presses are read, never movement.
+    pub reset_on_click: bool,
 }
 
 impl Default for General {
@@ -72,6 +77,7 @@ impl Default for General {
             exclude_steam_games: true,
             eager_correction: true,
             eager_min_word_length: 4,
+            reset_on_click: true,
         }
     }
 }
