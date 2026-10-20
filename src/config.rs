@@ -188,6 +188,10 @@ pub struct Experimental {
     /// or symbol. Letters typed before the text qualifies (the first six or
     /// so keys) are not protected.
     pub password_guard: bool,
+    /// Lower the second of two leading capitals in a finished word:
+    /// "ПРивет" -> "Привет". Only when the lowercase form is a real word, so
+    /// "PRs", "TVs" and "MHz" stay as they are.
+    pub double_caps_fix: bool,
 }
 
 pub fn default_path() -> PathBuf {

@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::keymap::{self, Lang};
 use crate::password::{self, TokenStats};
 use crate::userdata::UserData;
-use crate::{control, dictionary, hypr, steam, typer};
+use crate::{control, dictionary, hypr, steam, textfix, typer};
 use evdev::KeyCode;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -486,13 +486,17 @@ impl Engine {
             // recognized in either language. Keep it anyway: this is exactly
             // the case the manual flip hotkey exists for.
             let device_name = self.resolve_hypr_device_name(source_device);
-            self.last_word = self
-                .lang_for_device(device_name.as_deref())
-                .map(|lang| LastWord {
-                    keys: self.buffer.clone(),
-                    lang_on_screen: lang,
-                    trailing_spaces: 1,
-                });
+            let lang = self.lang_for_device(device_name.as_deref());
+            if let Some(lang) = lang
+                && !self.manually_flipped
+            {
+                self.fix_finished_word(lang);
+            }
+            self.last_word = lang.map(|lang| LastWord {
+                keys: self.buffer.clone(),
+                lang_on_screen: lang,
+                trailing_spaces: 1,
+            });
         }
         if password::ends_token(code) {
             self.end_token();
@@ -639,6 +643,27 @@ impl Engine {
             trailing_spaces,
         });
         true
+    }
+
+    /// A word just ended with Space and needed no layout correction: apply
+    /// the opt-in fixes that rewrite it in place (see `textfix`). `lang` is
+    /// the layout it was typed in; nothing is switched.
+    fn fix_finished_word(&mut self, lang: Lang) {
+        if self.overflowed || self.password_token {
+            return;
+        }
+        let text = on_screen_text(&self.buffer, lang);
+        let Some(fixed) = textfix::fix_word(&text, lang, &self.cfg.experimental, &self.user) else {
+            return;
+        };
+        tracing::info!(from = %text, to = %fixed, "fixing finished word");
+        // The word and the Space that ended it.
+        if let Err(e) = self
+            .io
+            .type_text(self.buffer.len() + 1, &format!("{fixed} "), 0)
+        {
+            tracing::warn!("failed to retype fixed word: {e:#}");
+        }
     }
 
     /// The one place a correction touches the outside world: makes `target`
@@ -883,6 +908,13 @@ impl Engine {
             excluded: self.excluded,
         }
     }
+}
+
+/// What `keys` look like on screen when typed under `lang`.
+fn on_screen_text(keys: &[TypedKey], lang: Lang) -> String {
+    keys.iter()
+        .filter_map(|k| keymap::char_for(k.code, k.shift, k.capslock, lang))
+        .collect()
 }
 
 /// The `(text, language)` a word would become if manually flipped from
@@ -1772,6 +1804,61 @@ mod tests {
         // The next word is judged normally again.
         type_privet_and_space(&mut engine);
         assert!(!script.borrow().calls.is_empty());
+    }
+
+    fn type_with_shift(engine: &mut Engine, codes: &[(KeyCode, bool)]) {
+        for &(code, shift) in codes {
+            if shift {
+                engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
+            }
+            tap(engine, code);
+            if shift {
+                engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, UP);
+            }
+        }
+    }
+
+    // "HEllo": H and E typed with Shift held.
+    const HELLO_TWO_CAPS: [(KeyCode, bool); 5] = [
+        (KeyCode::KEY_H, true),
+        (KeyCode::KEY_E, true),
+        (KeyCode::KEY_L, false),
+        (KeyCode::KEY_L, false),
+        (KeyCode::KEY_O, false),
+    ];
+
+    #[test]
+    fn double_caps_is_fixed_at_space_when_enabled() {
+        let (mut engine, script) = scripted_engine(|cfg| cfg.experimental.double_caps_fix = true);
+        type_with_shift(&mut engine, &HELLO_TWO_CAPS);
+        assert!(script.borrow().calls.is_empty()); // nothing until the word ends
+        tap(&mut engine, KeyCode::KEY_SPACE);
+        // 5 letters + the Space, retyped with the second capital lowered.
+        assert_eq!(script.borrow().calls, ["type 6 \"Hello \" 0"]);
+        assert_eq!(engine.last_word.unwrap().lang_on_screen, Lang::En);
+    }
+
+    #[test]
+    fn double_caps_is_left_alone_by_default() {
+        let (mut engine, script) = scripted_engine(|_| {});
+        type_with_shift(&mut engine, &HELLO_TWO_CAPS);
+        tap(&mut engine, KeyCode::KEY_SPACE);
+        assert!(script.borrow().calls.is_empty());
+    }
+
+    #[test]
+    fn double_caps_fix_is_skipped_inside_a_password() {
+        let (mut engine, script) = scripted_engine(|cfg| {
+            cfg.experimental.double_caps_fix = true;
+            cfg.experimental.password_guard = true;
+        });
+        type_with_shift(
+            &mut engine,
+            &[(KeyCode::KEY_1, false), (KeyCode::KEY_2, false)],
+        );
+        type_with_shift(&mut engine, &HELLO_TWO_CAPS);
+        tap(&mut engine, KeyCode::KEY_SPACE);
+        assert!(script.borrow().calls.is_empty());
     }
 
     #[test]

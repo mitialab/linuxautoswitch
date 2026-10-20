@@ -6,6 +6,7 @@ mod hypr;
 mod keymap;
 mod password;
 mod steam;
+mod textfix;
 mod tray;
 mod typer;
 mod userdata;

@@ -129,3 +129,8 @@ layout_switch_retry_delay_ms = 50
 # before it qualifies, so it doesn't replace excluding a password manager's
 # window in excluded_classes.
 password_guard = false
+
+# Fix two leading capitals when you finish a word with Space:
+# "ПРивет" -> "Привет", "HEllo" -> "Hello". Only when the lowercase form is a
+# real word, so "PRs", "TVs", "MHz" and "GPUs" are never touched.
+double_caps_fix = false
