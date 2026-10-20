@@ -186,6 +186,15 @@ pub fn default_path() -> PathBuf {
     base.join("linuxautoswitch").join("config.toml")
 }
 
+/// The directory holding `config.toml` (and the user's word lists).
+pub fn dir(path: Option<&std::path::Path>) -> PathBuf {
+    let path = path.map(PathBuf::from).unwrap_or_else(default_path);
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
 pub fn load(path: Option<PathBuf>) -> anyhow::Result<Config> {
     let path = path.unwrap_or_else(default_path);
     match std::fs::read_to_string(&path) {

@@ -7,6 +7,7 @@ mod keymap;
 mod steam;
 mod tray;
 mod typer;
+mod userdata;
 
 use clap::{Parser, Subcommand};
 use evdev::KeyCode;
@@ -290,6 +291,7 @@ fn waybar_json(resp: Option<&control::ControlResponse>) -> String {
 
 fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     init_logging();
+    let config_dir = config::dir(config_path.as_deref());
     let cfg = config::load(config_path)?;
 
     tracing::info!("linuxautoswitch starting");
@@ -331,7 +333,7 @@ fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         }
     });
 
-    let mut engine = engine::Engine::new(cfg);
+    let mut engine = engine::Engine::new(cfg).with_user_data(userdata::UserData::load(&config_dir));
     let mut last_tray_status: Option<engine::Status> = None;
     for event in rx {
         match event {

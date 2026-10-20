@@ -1,0 +1,138 @@
+//! Words and rules that belong to the person rather than to the bundled
+//! dictionaries: their own vocabulary (names, jargon, project terms), loaded
+//! from plain text files next to `config.toml`.
+//!
+//! - `words-en.txt` / `words-ru.txt` - one word per line, `#` starts a
+//!   comment. A word listed here counts as a real word of that language, so
+//!   it is neither "fixed" when typed in its own layout nor mistaken for
+//!   gibberish when it is typed in the other one.
+//!
+//! The files are read once at startup; restart the daemon after editing.
+
+use crate::keymap::Lang;
+use std::collections::BTreeSet;
+use std::ops::Bound;
+use std::path::Path;
+
+#[derive(Default)]
+pub struct UserData {
+    en: BTreeSet<String>,
+    ru: BTreeSet<String>,
+}
+
+impl UserData {
+    /// Reads the word lists from `dir`. A missing file is just an empty list;
+    /// an unreadable one is logged and skipped, never fatal.
+    pub fn load(dir: &Path) -> Self {
+        let read = |name: &str| match std::fs::read_to_string(dir.join(name)) {
+            Ok(text) => {
+                let words = parse_word_list(&text);
+                tracing::info!(file = name, words = words.len(), "loaded user word list");
+                words
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
+            Err(e) => {
+                tracing::warn!(file = name, "could not read user word list: {e}");
+                BTreeSet::new()
+            }
+        };
+        Self {
+            en: read("words-en.txt"),
+            ru: read("words-ru.txt"),
+        }
+    }
+
+    fn words(&self, lang: Lang) -> &BTreeSet<String> {
+        match lang {
+            Lang::En => &self.en,
+            Lang::Ru => &self.ru,
+        }
+    }
+
+    /// Whether `word` is in the person's own `lang` list. Case-insensitive.
+    pub fn knows(&self, lang: Lang, word: &str) -> bool {
+        let words = self.words(lang);
+        !words.is_empty() && words.contains(&word.to_lowercase())
+    }
+
+    /// Whether a listed word is strictly longer than `prefix` and starts
+    /// with it. Case-insensitive.
+    pub fn has_longer_word(&self, lang: Lang, prefix: &str) -> bool {
+        let words = self.words(lang);
+        if words.is_empty() {
+            return false;
+        }
+        let prefix = prefix.to_lowercase();
+        words
+            .range::<str, _>((Bound::Included(prefix.as_str()), Bound::Unbounded))
+            .take_while(|w| w.starts_with(&prefix))
+            .any(|w| w.len() > prefix.len())
+    }
+}
+
+fn parse_word_list(text: &str) -> BTreeSet<String> {
+    text.lines()
+        .map(|line| line.split('#').next().unwrap_or("").trim())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data(en: &str, ru: &str) -> UserData {
+        UserData {
+            en: parse_word_list(en),
+            ru: parse_word_list(ru),
+        }
+    }
+
+    #[test]
+    fn parses_words_comments_and_blank_lines() {
+        let list = parse_word_list("Hyprland\n\n# a comment\n  Omarchy  # trailing note\n");
+        assert_eq!(
+            list.into_iter().collect::<Vec<_>>(),
+            ["hyprland", "omarchy"]
+        );
+    }
+
+    #[test]
+    fn lookup_is_case_insensitive_and_per_language() {
+        let user = data("Hyprland\n", "Омархи\n");
+        assert!(user.knows(Lang::En, "HYPRLAND"));
+        assert!(user.knows(Lang::Ru, "омархи"));
+        assert!(!user.knows(Lang::Ru, "hyprland"));
+        assert!(!user.knows(Lang::En, "waybar"));
+    }
+
+    #[test]
+    fn prefix_lookup_needs_a_strictly_longer_word() {
+        let user = data("hyprland\nhypr\n", "");
+        assert!(user.has_longer_word(Lang::En, "hypr")); // hyprland
+        assert!(user.has_longer_word(Lang::En, "HYP"));
+        assert!(!user.has_longer_word(Lang::En, "hyprland"));
+        assert!(!user.has_longer_word(Lang::En, "wayb"));
+        assert!(!user.has_longer_word(Lang::Ru, "hypr"));
+    }
+
+    #[test]
+    fn missing_files_are_an_empty_list() {
+        let dir = std::env::temp_dir().join("linuxautoswitch-no-such-dir-for-tests");
+        let user = UserData::load(&dir);
+        assert!(!user.knows(Lang::En, "anything"));
+    }
+
+    #[test]
+    fn loads_files_from_a_directory() {
+        let dir = std::env::temp_dir().join(format!("las-userdata-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("words-en.txt"), "Quickshell\n").unwrap();
+        std::fs::write(dir.join("words-ru.txt"), "# nothing yet\nомарчи\n").unwrap();
+        let user = UserData::load(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(user.knows(Lang::En, "quickshell"));
+        assert!(user.knows(Lang::Ru, "Омарчи"));
+    }
+}

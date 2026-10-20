@@ -195,6 +195,22 @@ Set `hotkeys.enabled = false` to turn off both, or change either key
 combination to any of: `leftshift`, `rightshift`, `leftctrl`, `rightctrl`,
 `leftalt`, `rightalt`, `leftmeta`/`leftsuper`, `rightmeta`/`rightsuper`.
 
+## Your own words
+
+Names, jargon and project terms that are in neither bundled dictionary can be
+added as plain text files next to `config.toml`
+(`~/.config/linuxautoswitch/`):
+
+- `words-en.txt` - your own English words
+- `words-ru.txt` - your own Russian words
+
+One word per line, `#` starts a comment, case doesn't matter. A listed word
+counts as a real word of that language: it is left alone when typed in its own
+layout (so `hyprland` is never "fixed"), and recognized when typed in the
+other one (so a Russian project name typed on the English layout is
+corrected). The files are read once at startup; restart the daemon after
+editing them.
+
 ## Checking status: shell, tray icon, or status bar
 
 ### Shell

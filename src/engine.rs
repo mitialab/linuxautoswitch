@@ -3,6 +3,7 @@
 
 use crate::config::Config;
 use crate::keymap::{self, Lang};
+use crate::userdata::UserData;
 use crate::{control, dictionary, hypr, steam, typer};
 use evdev::KeyCode;
 use std::collections::HashMap;
@@ -128,6 +129,7 @@ impl Io for SystemIo {
 
 pub struct Engine {
     cfg: Config,
+    user: UserData,
     io: Box<dyn Io>,
     buffer: Vec<TypedKey>,
     /// Set once the current word runs past `MAX_WORD_KEYS`.
@@ -187,6 +189,12 @@ impl Engine {
         Self::with_io(cfg, Box::new(SystemIo))
     }
 
+    /// Adds the person's own word lists to the bundled dictionaries.
+    pub fn with_user_data(mut self, user: UserData) -> Self {
+        self.user = user;
+        self
+    }
+
     fn with_io(mut cfg: Config, io: Box<dyn Io>) -> Self {
         // Lowercase every case-insensitive matcher once up front so the
         // comparisons below don't allocate.
@@ -220,6 +228,7 @@ impl Engine {
 
         let mut engine = Self {
             cfg,
+            user: UserData::default(),
             io,
             buffer: Vec::new(),
             overflowed: false,
@@ -569,7 +578,8 @@ impl Engine {
         };
 
         let other_lang = current_lang.other();
-        let Some(corrected) = correction(&self.buffer, current_lang, min_length, eager) else {
+        let Some(corrected) = correction(&self.buffer, current_lang, min_length, eager, &self.user)
+        else {
             return false;
         };
 
@@ -900,6 +910,17 @@ fn resolve_hotkey_mask(field: &str, names: &[String]) -> u8 {
 /// flip.
 const MIN_CORRECTION_LENGTH: usize = 2;
 
+/// Whether `word` is a real word of `lang`: bundled dictionary or the
+/// person's own list.
+fn is_word(user: &UserData, lang: Lang, word: &str) -> bool {
+    dictionary::contains(lang, word) || user.knows(lang, word)
+}
+
+/// Whether some known `lang` word is longer than `prefix` and starts with it.
+fn may_continue(user: &UserData, lang: Lang, prefix: &str) -> bool {
+    dictionary::has_longer_word(lang, prefix) || user.has_longer_word(lang, prefix)
+}
+
 /// The text `keys` should be replaced with if they were typed in the wrong
 /// layout (`current_lang` being the active one), or `None` to leave them.
 fn correction(
@@ -907,6 +928,7 @@ fn correction(
     current_lang: Lang,
     min_word_length: usize,
     eager: bool,
+    user: &UserData,
 ) -> Option<String> {
     let min_word_length = min_word_length.max(MIN_CORRECTION_LENGTH);
     let en_word: String = keys
@@ -936,20 +958,20 @@ fn correction(
 
     // Already a real word in the layout that's actually active: nothing
     // to do.
-    if dictionary::contains(current_lang, typed_core) {
+    if is_word(user, current_lang, typed_core) {
         return None;
     }
     // Only correct when the *other* interpretation is a real word - an
     // unrecognized word in both dictionaries is far more likely to be a
     // name, a command, or a typo than a layout mistake.
-    if !dictionary::contains(other_lang, other_core) {
+    if !is_word(user, other_lang, other_core) {
         return None;
     }
     // Mid-word (eager) only: the text typed so far isn't a word, but it is
     // the start of one in the layout that is actually active, so the person
     // is most likely still typing it. Wait for more keys; the Space check
     // still covers the case where they really did type the wrong layout.
-    if eager && dictionary::has_longer_word(current_lang, typed_core) {
+    if eager && may_continue(user, current_lang, typed_core) {
         tracing::debug!(typed = %typed_word, "not correcting yet: may be a word still being typed");
         return None;
     }
@@ -1056,7 +1078,7 @@ mod tests {
     #[test]
     fn corrects_word_typed_in_wrong_layout() {
         assert_eq!(
-            correction(&keys(&PRIVET), Lang::En, 3, false).as_deref(),
+            correction(&keys(&PRIVET), Lang::En, 3, false, &UserData::default()).as_deref(),
             Some("привет")
         );
     }
@@ -1067,7 +1089,7 @@ mod tests {
         let mut codes = PRIVET.to_vec();
         codes.push(KeyCode::KEY_SLASH);
         assert_eq!(
-            correction(&keys(&codes), Lang::En, 3, false).as_deref(),
+            correction(&keys(&codes), Lang::En, 3, false, &UserData::default()).as_deref(),
             Some("привет.")
         );
     }
@@ -1083,7 +1105,10 @@ mod tests {
             KeyCode::KEY_O,
             KeyCode::KEY_COMMA,
         ];
-        assert_eq!(correction(&keys(&codes), Lang::En, 3, false), None);
+        assert_eq!(
+            correction(&keys(&codes), Lang::En, 3, false, &UserData::default()),
+            None
+        );
     }
 
     #[test]
@@ -1102,7 +1127,7 @@ mod tests {
             KeyCode::KEY_E,
         ];
         assert_eq!(
-            correction(&keys(&codes), Lang::Ru, 3, false).as_deref(),
+            correction(&keys(&codes), Lang::Ru, 3, false, &UserData::default()).as_deref(),
             Some("google")
         );
     }
@@ -1118,11 +1143,69 @@ mod tests {
             KeyCode::KEY_E,
             KeyCode::KEY_N,
         ];
-        assert_eq!(correction(&keys(&codes), Lang::En, 4, true), None);
+        assert_eq!(
+            correction(&keys(&codes), Lang::En, 4, true, &UserData::default()),
+            None
+        );
         // Once the word is confirmed finished (Space), it is judged as before.
         assert_eq!(
-            correction(&keys(&codes), Lang::En, 4, false).as_deref(),
+            correction(&keys(&codes), Lang::En, 4, false, &UserData::default()).as_deref(),
             Some("идут")
+        );
+    }
+
+    fn user_words(en: &str, ru: &str) -> UserData {
+        let dir = std::env::temp_dir().join(format!(
+            "las-engine-{}-{}",
+            std::process::id(),
+            en.len() * 31 + ru.len()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("words-en.txt"), en).unwrap();
+        std::fs::write(dir.join("words-ru.txt"), ru).unwrap();
+        let user = UserData::load(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        user
+    }
+
+    #[test]
+    fn own_word_typed_in_the_wrong_layout_is_corrected() {
+        // "qwfp" is no word in either language...
+        let codes = [
+            KeyCode::KEY_Q,
+            KeyCode::KEY_W,
+            KeyCode::KEY_F,
+            KeyCode::KEY_P,
+        ];
+        assert_eq!(
+            correction(&keys(&codes), Lang::En, 3, false, &UserData::default()),
+            None
+        );
+        // ...until "йцаз" is in the person's Russian list.
+        let user = user_words("", "йцаз\n");
+        assert_eq!(
+            correction(&keys(&codes), Lang::En, 3, false, &user).as_deref(),
+            Some("йцаз")
+        );
+    }
+
+    #[test]
+    fn own_word_in_the_active_layout_is_left_alone() {
+        // "ghbdtn" would become "привет" - unless it is the person's own
+        // English word (a handle, a project name).
+        let user = user_words("ghbdtn\n", "");
+        assert_eq!(correction(&keys(&PRIVET), Lang::En, 3, false, &user), None);
+    }
+
+    #[test]
+    fn own_longer_word_holds_back_the_eager_check() {
+        // "ghbdtn" is a prefix of the person's "ghbdtnzzz"; mid-word they are
+        // probably still typing it.
+        let user = user_words("ghbdtnzzz\n", "");
+        assert_eq!(correction(&keys(&PRIVET), Lang::En, 4, true, &user), None);
+        assert_eq!(
+            correction(&keys(&PRIVET), Lang::En, 4, false, &user).as_deref(),
+            Some("привет")
         );
     }
 
@@ -1131,7 +1214,7 @@ mod tests {
         // "ghbdtn" is not the start of any English word, so nothing holds it
         // back.
         assert_eq!(
-            correction(&keys(&PRIVET), Lang::En, 4, true).as_deref(),
+            correction(&keys(&PRIVET), Lang::En, 4, true, &UserData::default()).as_deref(),
             Some("привет")
         );
     }
@@ -1144,7 +1227,7 @@ mod tests {
         // complete, so even a 2-letter word like this can be trusted.
         let codes = [KeyCode::KEY_J, KeyCode::KEY_Y];
         assert_eq!(
-            correction(&keys(&codes), Lang::En, 2, false).as_deref(),
+            correction(&keys(&codes), Lang::En, 2, false, &UserData::default()).as_deref(),
             Some("он")
         );
     }
@@ -1156,13 +1239,19 @@ mod tests {
         // complete short word from the first two letters of a longer one,
         // so eager checking should hold off.
         let codes = [KeyCode::KEY_J, KeyCode::KEY_Y];
-        assert_eq!(correction(&keys(&codes), Lang::En, 4, false), None);
+        assert_eq!(
+            correction(&keys(&codes), Lang::En, 4, false, &UserData::default()),
+            None
+        );
     }
 
     #[test]
     fn single_letter_is_never_corrected_even_if_configured_to() {
         let codes = [KeyCode::KEY_J];
-        assert_eq!(correction(&keys(&codes), Lang::En, 1, false), None);
+        assert_eq!(
+            correction(&keys(&codes), Lang::En, 1, false, &UserData::default()),
+            None
+        );
     }
 
     #[test]
