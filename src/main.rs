@@ -4,6 +4,7 @@ mod dictionary;
 mod engine;
 mod hypr;
 mod keymap;
+mod password;
 mod steam;
 mod tray;
 mod typer;

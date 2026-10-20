@@ -10,6 +10,7 @@ pub struct Config {
     pub hypr: HyprCfg,
     pub hotkeys: Hotkeys,
     pub timing: Timing,
+    pub experimental: Experimental,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -175,6 +176,18 @@ impl Default for Timing {
             layout_switch_retry_delay_ms: 50,
         }
     }
+}
+
+/// Features that are new and less proven. Each is off by default; turn one on
+/// to try it, and expect rough edges.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct Experimental {
+    /// Never "correct" text that looks like a password: longer than six keys
+    /// without a Space, Enter or Tab, mixing lowercase, uppercase and a digit
+    /// or symbol. Letters typed before the text qualifies (the first six or
+    /// so keys) are not protected.
+    pub password_guard: bool,
 }
 
 pub fn default_path() -> PathBuf {

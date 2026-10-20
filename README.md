@@ -211,6 +211,18 @@ other one (so a Russian project name typed on the English layout is
 corrected). The files are read once at startup; restart the daemon after
 editing them.
 
+## Experimental features
+
+Off by default; switch one on in the `[experimental]` table of `config.toml`
+(see `assets/config.example.toml`) to try it.
+
+- `password_guard` - never "correct" text that looks like a password: longer
+  than six keys without a Space, Enter or Tab, mixing lowercase, uppercase and
+  a digit or symbol. It guesses from the shape of the text, since Wayland
+  doesn't say which field has focus, and the first six or so keys are typed
+  before it qualifies - it doesn't replace listing a password manager in
+  `excluded_classes`.
+
 ## Checking status: shell, tray icon, or status bar
 
 ### Shell

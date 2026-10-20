@@ -90,7 +90,7 @@ pub fn is_word_key(key: KeyCode) -> bool {
 /// (see `table` above) are handled separately in `char_for`, since real
 /// keyboards apply Caps Lock to *all* Cyrillic letter positions but only to
 /// a-z on a US layout.
-fn is_az(key: KeyCode) -> bool {
+pub fn is_az(key: KeyCode) -> bool {
     matches!(
         key,
         KeyCode::KEY_A

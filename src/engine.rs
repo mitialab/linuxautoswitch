@@ -3,6 +3,7 @@
 
 use crate::config::Config;
 use crate::keymap::{self, Lang};
+use crate::password::{self, TokenStats};
 use crate::userdata::UserData;
 use crate::{control, dictionary, hypr, steam, typer};
 use evdev::KeyCode;
@@ -131,6 +132,12 @@ pub struct Engine {
     cfg: Config,
     user: UserData,
     io: Box<dyn Io>,
+    /// What has been typed since the last Space/Enter/Tab, summarized, for
+    /// the password guard.
+    token: TokenStats,
+    /// The current token looks like a password; corrections are suppressed
+    /// until it ends.
+    password_token: bool,
     buffer: Vec<TypedKey>,
     /// Set once the current word runs past `MAX_WORD_KEYS`.
     overflowed: bool,
@@ -230,6 +237,8 @@ impl Engine {
             cfg,
             user: UserData::default(),
             io,
+            token: TokenStats::default(),
+            password_token: false,
             buffer: Vec::new(),
             overflowed: false,
             manually_flipped: false,
@@ -310,6 +319,12 @@ impl Engine {
     fn forget_words(&mut self) {
         self.reset_word();
         self.last_word = None;
+        self.end_token();
+    }
+
+    fn end_token(&mut self) {
+        self.token.clear();
+        self.password_token = false;
     }
 
     fn reset_word(&mut self) {
@@ -385,6 +400,7 @@ impl Engine {
         }
 
         if code == KeyCode::KEY_BACKSPACE {
+            self.token.pop();
             if self.buffer.pop().is_none() {
                 // Deleting past the current word eats into what follows the
                 // last word: a trailing space, or the word itself.
@@ -402,6 +418,15 @@ impl Engine {
             // the shortcut may have changed the text (paste, select all).
             self.forget_words();
             return;
+        }
+
+        // A token ends at Space/Enter/Tab, but only *after* this key's own
+        // boundary check below, which still has to see the old token.
+        if !password::ends_token(code) && self.cfg.experimental.password_guard {
+            self.token.push(code, self.shift(), self.capslock);
+            if self.token.looks_like_password() {
+                self.password_token = true;
+            }
         }
 
         if keymap::is_word_key(code) {
@@ -468,6 +493,9 @@ impl Engine {
                     lang_on_screen: lang,
                     trailing_spaces: 1,
                 });
+        }
+        if password::ends_token(code) {
+            self.end_token();
         }
         self.reset_word();
     }
@@ -567,7 +595,10 @@ impl Engine {
         // Each key yields at most one letter, so a buffer shorter than the
         // minimum can't qualify. Checked first because eager correction runs
         // this on every keystroke.
-        if self.overflowed || self.buffer.len() < min_length.max(MIN_CORRECTION_LENGTH) {
+        if self.overflowed
+            || self.password_token
+            || self.buffer.len() < min_length.max(MIN_CORRECTION_LENGTH)
+        {
             return false;
         }
 
@@ -1693,6 +1724,54 @@ mod tests {
             script.borrow().calls,
             ["switch kbd0 1", "type 7 \"привет \" 0", "read kbd0"]
         );
+    }
+
+    /// "Q1!" then "ghbdtn": the token is password-like from the 7th key on,
+    /// while the word buffer (which ends at the 1 and the !) holds "ghbdtn".
+    fn type_password_like_text(engine: &mut Engine) {
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
+        tap(engine, KeyCode::KEY_Q);
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, UP);
+        tap(engine, KeyCode::KEY_1);
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
+        tap(engine, KeyCode::KEY_1);
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, UP);
+        for code in PRIVET {
+            tap(engine, code);
+        }
+    }
+
+    #[test]
+    fn password_guard_suppresses_corrections_inside_a_password() {
+        let (mut engine, script) = scripted_engine(|cfg| {
+            cfg.general.eager_correction = true;
+            cfg.experimental.password_guard = true;
+        });
+        type_password_like_text(&mut engine);
+        tap(&mut engine, KeyCode::KEY_SPACE);
+        assert!(
+            script.borrow().calls.is_empty(),
+            "{:?}",
+            script.borrow().calls
+        );
+    }
+
+    #[test]
+    fn without_the_guard_the_same_text_is_corrected() {
+        let (mut engine, script) = scripted_engine(|cfg| cfg.general.eager_correction = true);
+        type_password_like_text(&mut engine);
+        assert!(!script.borrow().calls.is_empty());
+    }
+
+    #[test]
+    fn password_guard_ends_with_the_token() {
+        let (mut engine, script) = scripted_engine(|cfg| cfg.experimental.password_guard = true);
+        type_password_like_text(&mut engine);
+        tap(&mut engine, KeyCode::KEY_SPACE);
+        assert!(engine.token == TokenStats::default() && !engine.password_token);
+        // The next word is judged normally again.
+        type_privet_and_space(&mut engine);
+        assert!(!script.borrow().calls.is_empty());
     }
 
     #[test]

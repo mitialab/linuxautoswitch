@@ -117,3 +117,15 @@ delay_before_retype_ms = 0
 # many times (0 = never repeat), waiting this long before each repeat.
 layout_switch_retries = 2
 layout_switch_retry_delay_ms = 50
+
+[experimental]
+# New and less proven features. Each is off by default; turn one on to try
+# it, and expect rough edges.
+
+# Never "correct" text that looks like a password: longer than six keys
+# without a Space/Enter/Tab, mixing lowercase, uppercase and a digit or
+# symbol. It guesses from the shape of the text (Wayland doesn't say which
+# field has focus), and the first six or so keys of a password are typed
+# before it qualifies, so it doesn't replace excluding a password manager's
+# window in excluded_classes.
+password_guard = false
