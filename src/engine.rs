@@ -57,6 +57,25 @@ fn modifier_bit(code: KeyCode) -> Option<u8> {
     })
 }
 
+/// Buttons of a mouse, touchpad or touchscreen. A press moves the cursor
+/// without a key being typed, so the word being tracked is no longer where
+/// the cursor is. `BTN_TOUCH` also covers a touchpad tap-to-click, which
+/// libinput synthesizes and never shows up as `BTN_LEFT` on the raw device.
+pub fn is_pointer_button(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::BTN_LEFT
+            | KeyCode::BTN_RIGHT
+            | KeyCode::BTN_MIDDLE
+            | KeyCode::BTN_SIDE
+            | KeyCode::BTN_EXTRA
+            | KeyCode::BTN_FORWARD
+            | KeyCode::BTN_BACK
+            | KeyCode::BTN_TASK
+            | KeyCode::BTN_TOUCH
+    )
+}
+
 /// Longest run of word keys still treated as a word. Anything longer is
 /// not a real word (or is text we can't safely retype), so the buffer
 /// stops growing and no correction is attempted until the next boundary.
@@ -72,8 +91,44 @@ pub struct Status {
     pub excluded: bool,
 }
 
+/// Everything a correction does to the outside world, behind a trait so the
+/// order of those steps can be tested without a compositor or `wtype`.
+pub trait Io {
+    /// Switches `device` to the layout at `index` in its `kb_layout` list.
+    fn switch_layout(&mut self, device: &str, index: u32) -> anyhow::Result<()>;
+    /// The layout name Hyprland currently reports for `device`, if known.
+    fn active_keymap(&mut self, device: &str) -> anyhow::Result<Option<String>>;
+    /// Deletes `backspaces` characters, then types `text`.
+    fn type_text(&mut self, backspaces: usize, text: &str, delay_ms: u64) -> anyhow::Result<()>;
+    fn sleep_ms(&mut self, ms: u64);
+}
+
+struct SystemIo;
+
+impl Io for SystemIo {
+    fn switch_layout(&mut self, device: &str, index: u32) -> anyhow::Result<()> {
+        hypr::switch_layout(device, index)
+    }
+
+    fn active_keymap(&mut self, device: &str) -> anyhow::Result<Option<String>> {
+        Ok(hypr::get_keyboards()?
+            .into_iter()
+            .find(|kb| kb.name == device)
+            .map(|kb| kb.active_keymap))
+    }
+
+    fn type_text(&mut self, backspaces: usize, text: &str, delay_ms: u64) -> anyhow::Result<()> {
+        typer::correct_word(backspaces, text, delay_ms)
+    }
+
+    fn sleep_ms(&mut self, ms: u64) {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
 pub struct Engine {
     cfg: Config,
+    io: Box<dyn Io>,
     buffer: Vec<TypedKey>,
     /// Set once the current word runs past `MAX_WORD_KEYS`.
     overflowed: bool,
@@ -128,7 +183,11 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(mut cfg: Config) -> Self {
+    pub fn new(cfg: Config) -> Self {
+        Self::with_io(cfg, Box::new(SystemIo))
+    }
+
+    fn with_io(mut cfg: Config, io: Box<dyn Io>) -> Self {
         // Lowercase every case-insensitive matcher once up front so the
         // comparisons below don't allocate.
         for list in [
@@ -161,6 +220,7 @@ impl Engine {
 
         let mut engine = Self {
             cfg,
+            io,
             buffer: Vec::new(),
             overflowed: false,
             manually_flipped: false,
@@ -275,6 +335,13 @@ impl Engine {
     /// Autorepeat is handled like a key-down: a held letter or Backspace
     /// keeps typing or deleting on screen, so the buffer has to follow it.
     pub fn handle_key(&mut self, source_device: &str, code: KeyCode, value: i32) {
+        if is_pointer_button(code) {
+            if value == 1 {
+                self.handle_click();
+            }
+            return;
+        }
+
         let held = value != 0;
 
         if value == 1 {
@@ -351,7 +418,12 @@ impl Engine {
             // acted on it. This way the word is usually already fixed
             // before that happens.
             if self.cfg.general.eager_correction && !self.manually_flipped {
-                self.try_correct(source_device, "", self.cfg.general.eager_min_word_length);
+                self.try_correct(
+                    source_device,
+                    "",
+                    self.cfg.general.eager_min_word_length,
+                    true,
+                );
             }
             return;
         }
@@ -374,7 +446,7 @@ impl Engine {
         } else if !is_space || self.overflowed {
             self.last_word = None;
         } else if self.manually_flipped
-            || !self.try_correct(source_device, " ", self.cfg.general.min_word_length)
+            || !self.try_correct(source_device, " ", self.cfg.general.min_word_length, false)
         {
             // Not corrected - the word was fine, too short to check, or not
             // recognized in either language. Keep it anyway: this is exactly
@@ -389,6 +461,20 @@ impl Engine {
                 });
         }
         self.reset_word();
+    }
+
+    /// A pointer button went down: the cursor may now be anywhere, so
+    /// neither the word being typed nor the last completed one can be
+    /// retyped safely, and a click between two Shift taps (or during the
+    /// pause chord) means they weren't a clean hotkey.
+    fn handle_click(&mut self) {
+        self.manual_tap_pending = false;
+        self.manual_correct_last_tap = None;
+        if self.modifiers & self.toggle_pause_mask != 0 {
+            self.toggle_pause_dirty = true;
+            self.toggle_pause_armed = false;
+        }
+        self.forget_words();
     }
 
     /// Hotkeys are clean taps and chords: they only count when no other key
@@ -462,7 +548,13 @@ impl Engine {
     /// correction was made; only then is the buffer cleared, since a caller
     /// still mid-word (the eager path) needs to keep accumulating
     /// otherwise.
-    fn try_correct(&mut self, source_device: &str, boundary: &str, min_length: usize) -> bool {
+    fn try_correct(
+        &mut self,
+        source_device: &str,
+        boundary: &str,
+        min_length: usize,
+        eager: bool,
+    ) -> bool {
         // Each key yields at most one letter, so a buffer shorter than the
         // minimum can't qualify. Checked first because eager correction runs
         // this on every keystroke.
@@ -477,20 +569,25 @@ impl Engine {
         };
 
         let other_lang = current_lang.other();
-        let Some(corrected) = correction(&self.buffer, current_lang, min_length) else {
+        let Some(corrected) = correction(&self.buffer, current_lang, min_length, eager) else {
             return false;
         };
 
         let keys_snapshot = self.buffer.clone();
         let trailing_spaces = boundary.chars().count();
         let backspaces = self.buffer.len() + trailing_spaces;
-        if let Err(e) = typer::correct_word(backspaces, &format!("{corrected}{boundary}")) {
-            tracing::warn!("failed to retype corrected word: {e:#}");
+        if !self.replace_and_switch(
+            device_name.as_deref(),
+            current_lang,
+            other_lang,
+            backspaces,
+            &format!("{corrected}{boundary}"),
+        ) {
             return false;
         }
         // Whatever was typed is gone now regardless of whether the layout
-        // switch below succeeds - don't let a stale buffer trigger another
-        // correction on top of this one.
+        // switch took - don't let a stale buffer trigger another correction
+        // on top of this one.
         self.reset_word();
         // The word now on screen is in `other_lang` - if it's still wrong
         // (a name that happened to also look wrong in the dictionary's
@@ -500,27 +597,108 @@ impl Engine {
             lang_on_screen: other_lang,
             trailing_spaces,
         });
+        true
+    }
 
-        match device_name {
-            Some(device_name) => {
-                let index = match other_lang {
-                    Lang::En => self.cfg.layouts.english_index,
-                    Lang::Ru => self.cfg.layouts.russian_index,
-                };
-                match hypr::switch_layout(&device_name, index) {
-                    Ok(()) => {
-                        self.device_lang.insert(device_name, other_lang);
-                        self.last_lang = Some(other_lang);
-                    }
-                    Err(e) => tracing::warn!("failed to switch layout: {e:#}"),
+    /// The one place a correction touches the outside world: makes `target`
+    /// the active layout and replaces `backspaces` characters before the
+    /// cursor with `text`. Returns whether the text was typed.
+    ///
+    /// The layout is switched *first*, in one fast socket call. The daemon
+    /// can only read keys, not hold them back, so anything typed while the
+    /// correction runs lands in the application before the correction does;
+    /// switching first at least makes those keys come out in the new layout.
+    /// The text is typed through `wtype`'s own keymap, so it doesn't depend on
+    /// the switch. Afterwards the layout is read back and the switch repeated
+    /// if it didn't take (see `Timing`).
+    fn replace_and_switch(
+        &mut self,
+        device: Option<&str>,
+        current: Lang,
+        target: Lang,
+        backspaces: usize,
+        text: &str,
+    ) -> bool {
+        let timing = self.cfg.timing.clone();
+        let switched = match device {
+            Some(device) => match self.io.switch_layout(device, self.layout_index(target)) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("failed to switch layout: {e:#}");
+                    false
+                }
+            },
+            None => {
+                tracing::warn!(
+                    "could not resolve a hyprland keyboard device; \
+                     set `hypr.device_name_override` in the config"
+                );
+                false
+            }
+        };
+        if switched && timing.delay_after_layout_switch_ms > 0 {
+            self.io.sleep_ms(timing.delay_after_layout_switch_ms);
+        }
+
+        if let Err(e) = self
+            .io
+            .type_text(backspaces, text, timing.delay_before_retype_ms)
+        {
+            tracing::warn!("failed to retype corrected word: {e:#}");
+            if switched && let Some(device) = device {
+                // Don't leave the layout switched with the text untouched.
+                if let Err(e) = self.io.switch_layout(device, self.layout_index(current)) {
+                    tracing::warn!("failed to switch the layout back: {e:#}");
                 }
             }
-            None => tracing::warn!(
-                "could not resolve a hyprland keyboard device for '{source_device}'; \
-                 set `hypr.device_name_override` in the config"
-            ),
+            return false;
+        }
+
+        if switched && let Some(device) = device {
+            self.confirm_layout(device, target);
         }
         true
+    }
+
+    fn layout_index(&self, lang: Lang) -> u32 {
+        match lang {
+            Lang::En => self.cfg.layouts.english_index,
+            Lang::Ru => self.cfg.layouts.russian_index,
+        }
+    }
+
+    /// Reads the layout back from Hyprland and repeats the switch while it
+    /// differs from `target`, up to `timing.layout_switch_retries` times.
+    /// When the layout can't be read at all the switch is trusted, as it was
+    /// before verification existed.
+    fn confirm_layout(&mut self, device: &str, target: Lang) {
+        let mut attempt = 0;
+        loop {
+            let reported = match self.io.active_keymap(device) {
+                Ok(Some(keymap)) => detect_lang(&keymap, &self.cfg),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::debug!("could not read the active layout back: {e:#}");
+                    None
+                }
+            };
+            if reported.is_none() || reported == Some(target) {
+                self.device_lang.insert(device.to_string(), target);
+                self.last_lang = Some(target);
+                return;
+            }
+            if attempt >= self.cfg.timing.layout_switch_retries {
+                tracing::warn!(?target, ?reported, "layout did not switch after retrying");
+                return;
+            }
+            attempt += 1;
+            tracing::debug!(attempt, "layout not switched yet, retrying");
+            self.io
+                .sleep_ms(self.cfg.timing.layout_switch_retry_delay_ms);
+            if let Err(e) = self.io.switch_layout(device, self.layout_index(target)) {
+                tracing::warn!("failed to switch layout: {e:#}");
+            }
+        }
     }
 
     fn lang_for_device(&self, device_name: Option<&str>) -> Option<Lang> {
@@ -620,29 +798,15 @@ impl Engine {
         tracing::info!(to = %corrected, ?target_lang, "manually flipping word");
 
         let text = corrected + &" ".repeat(trailing_spaces);
-        if let Err(e) = typer::correct_word(keys.len() + trailing_spaces, &text) {
-            tracing::warn!("failed to retype flipped word: {e:#}");
+        let device_name = self.resolve_hypr_device_name(source_device);
+        if !self.replace_and_switch(
+            device_name.as_deref(),
+            on_screen_lang,
+            target_lang,
+            keys.len() + trailing_spaces,
+            &text,
+        ) {
             return None;
-        }
-
-        match self.resolve_hypr_device_name(source_device) {
-            Some(device_name) => {
-                let index = match target_lang {
-                    Lang::En => self.cfg.layouts.english_index,
-                    Lang::Ru => self.cfg.layouts.russian_index,
-                };
-                match hypr::switch_layout(&device_name, index) {
-                    Ok(()) => {
-                        self.device_lang.insert(device_name, target_lang);
-                        self.last_lang = Some(target_lang);
-                    }
-                    Err(e) => tracing::warn!("failed to switch layout: {e:#}"),
-                }
-            }
-            None => tracing::warn!(
-                "could not resolve a hyprland keyboard device for '{source_device}'; \
-                 set `hypr.device_name_override` in the config"
-            ),
         }
         Some(target_lang)
     }
@@ -738,7 +902,12 @@ const MIN_CORRECTION_LENGTH: usize = 2;
 
 /// The text `keys` should be replaced with if they were typed in the wrong
 /// layout (`current_lang` being the active one), or `None` to leave them.
-fn correction(keys: &[TypedKey], current_lang: Lang, min_word_length: usize) -> Option<String> {
+fn correction(
+    keys: &[TypedKey],
+    current_lang: Lang,
+    min_word_length: usize,
+    eager: bool,
+) -> Option<String> {
     let min_word_length = min_word_length.max(MIN_CORRECTION_LENGTH);
     let en_word: String = keys
         .iter()
@@ -774,6 +943,14 @@ fn correction(keys: &[TypedKey], current_lang: Lang, min_word_length: usize) -> 
     // unrecognized word in both dictionaries is far more likely to be a
     // name, a command, or a typo than a layout mistake.
     if !dictionary::contains(other_lang, other_core) {
+        return None;
+    }
+    // Mid-word (eager) only: the text typed so far isn't a word, but it is
+    // the start of one in the layout that is actually active, so the person
+    // is most likely still typing it. Wait for more keys; the Space check
+    // still covers the case where they really did type the wrong layout.
+    if eager && dictionary::has_longer_word(current_lang, typed_core) {
+        tracing::debug!(typed = %typed_word, "not correcting yet: may be a word still being typed");
         return None;
     }
 
@@ -879,7 +1056,7 @@ mod tests {
     #[test]
     fn corrects_word_typed_in_wrong_layout() {
         assert_eq!(
-            correction(&keys(&PRIVET), Lang::En, 3).as_deref(),
+            correction(&keys(&PRIVET), Lang::En, 3, false).as_deref(),
             Some("привет")
         );
     }
@@ -890,7 +1067,7 @@ mod tests {
         let mut codes = PRIVET.to_vec();
         codes.push(KeyCode::KEY_SLASH);
         assert_eq!(
-            correction(&keys(&codes), Lang::En, 3).as_deref(),
+            correction(&keys(&codes), Lang::En, 3, false).as_deref(),
             Some("привет.")
         );
     }
@@ -906,7 +1083,7 @@ mod tests {
             KeyCode::KEY_O,
             KeyCode::KEY_COMMA,
         ];
-        assert_eq!(correction(&keys(&codes), Lang::En, 3), None);
+        assert_eq!(correction(&keys(&codes), Lang::En, 3, false), None);
     }
 
     #[test]
@@ -925,8 +1102,37 @@ mod tests {
             KeyCode::KEY_E,
         ];
         assert_eq!(
-            correction(&keys(&codes), Lang::Ru, 3).as_deref(),
+            correction(&keys(&codes), Lang::Ru, 3, false).as_deref(),
             Some("google")
+        );
+    }
+
+    #[test]
+    fn partial_word_in_active_layout_is_not_corrected_eagerly() {
+        // "blen" (the start of "blend") is "идут" on the Russian layout, a
+        // real Russian word - but someone typing on the English layout is
+        // far more likely to be halfway through "blend".
+        let codes = [
+            KeyCode::KEY_B,
+            KeyCode::KEY_L,
+            KeyCode::KEY_E,
+            KeyCode::KEY_N,
+        ];
+        assert_eq!(correction(&keys(&codes), Lang::En, 4, true), None);
+        // Once the word is confirmed finished (Space), it is judged as before.
+        assert_eq!(
+            correction(&keys(&codes), Lang::En, 4, false).as_deref(),
+            Some("идут")
+        );
+    }
+
+    #[test]
+    fn wrong_layout_word_is_still_corrected_eagerly() {
+        // "ghbdtn" is not the start of any English word, so nothing holds it
+        // back.
+        assert_eq!(
+            correction(&keys(&PRIVET), Lang::En, 4, true).as_deref(),
+            Some("привет")
         );
     }
 
@@ -938,7 +1144,7 @@ mod tests {
         // complete, so even a 2-letter word like this can be trusted.
         let codes = [KeyCode::KEY_J, KeyCode::KEY_Y];
         assert_eq!(
-            correction(&keys(&codes), Lang::En, 2).as_deref(),
+            correction(&keys(&codes), Lang::En, 2, false).as_deref(),
             Some("он")
         );
     }
@@ -950,13 +1156,13 @@ mod tests {
         // complete short word from the first two letters of a longer one,
         // so eager checking should hold off.
         let codes = [KeyCode::KEY_J, KeyCode::KEY_Y];
-        assert_eq!(correction(&keys(&codes), Lang::En, 4), None);
+        assert_eq!(correction(&keys(&codes), Lang::En, 4, false), None);
     }
 
     #[test]
     fn single_letter_is_never_corrected_even_if_configured_to() {
         let codes = [KeyCode::KEY_J];
-        assert_eq!(correction(&keys(&codes), Lang::En, 1), None);
+        assert_eq!(correction(&keys(&codes), Lang::En, 1, false), None);
     }
 
     #[test]
@@ -1001,7 +1207,11 @@ mod tests {
 
     #[test]
     fn autorepeat_backspace_keeps_deleting() {
-        let mut engine = Engine::new(Config::default());
+        // "ghbd" is "прив" on the Russian layout, a dictionary word, so eager
+        // correction would fire on the 4th key and empty the buffer.
+        let mut cfg = Config::default();
+        cfg.general.eager_correction = false;
+        let mut engine = Engine::new(cfg);
         for code in [
             KeyCode::KEY_G,
             KeyCode::KEY_H,
@@ -1217,6 +1427,262 @@ mod tests {
         // One more Backspace deletes into the word itself.
         tap(&mut engine, KeyCode::KEY_BACKSPACE);
         assert!(engine.last_word.is_none());
+    }
+
+    /// Records every outside-world step of a correction, in order, and plays
+    /// back scripted answers for the layout read-back.
+    #[derive(Default)]
+    struct Script {
+        calls: Vec<String>,
+        keymaps: std::collections::VecDeque<anyhow::Result<Option<String>>>,
+        fail_type: bool,
+    }
+
+    struct FakeIo(std::rc::Rc<std::cell::RefCell<Script>>);
+
+    impl Io for FakeIo {
+        fn switch_layout(&mut self, device: &str, index: u32) -> anyhow::Result<()> {
+            self.0
+                .borrow_mut()
+                .calls
+                .push(format!("switch {device} {index}"));
+            Ok(())
+        }
+
+        fn active_keymap(&mut self, device: &str) -> anyhow::Result<Option<String>> {
+            let mut script = self.0.borrow_mut();
+            script.calls.push(format!("read {device}"));
+            script
+                .keymaps
+                .pop_front()
+                .unwrap_or_else(|| Ok(Some("Russian".to_string())))
+        }
+
+        fn type_text(
+            &mut self,
+            backspaces: usize,
+            text: &str,
+            delay_ms: u64,
+        ) -> anyhow::Result<()> {
+            let mut script = self.0.borrow_mut();
+            script
+                .calls
+                .push(format!("type {backspaces} {text:?} {delay_ms}"));
+            if script.fail_type {
+                anyhow::bail!("wtype exited with 1");
+            }
+            Ok(())
+        }
+
+        fn sleep_ms(&mut self, ms: u64) {
+            self.0.borrow_mut().calls.push(format!("sleep {ms}"));
+        }
+    }
+
+    fn scripted_engine(
+        configure: impl FnOnce(&mut Config),
+    ) -> (Engine, std::rc::Rc<std::cell::RefCell<Script>>) {
+        let mut cfg = Config::default();
+        cfg.general.eager_correction = false;
+        cfg.hypr.device_name_override = Some("kbd0".to_string());
+        configure(&mut cfg);
+        let script = std::rc::Rc::new(std::cell::RefCell::new(Script::default()));
+        let mut engine = Engine::with_io(cfg, Box::new(FakeIo(script.clone())));
+        engine.last_lang = Some(Lang::En);
+        (engine, script)
+    }
+
+    fn type_privet_and_space(engine: &mut Engine) {
+        for code in PRIVET {
+            tap(engine, code);
+        }
+        tap(engine, KeyCode::KEY_SPACE);
+    }
+
+    fn english() -> anyhow::Result<Option<String>> {
+        Ok(Some("English (US)".to_string()))
+    }
+
+    #[test]
+    fn layout_is_switched_before_the_text_is_typed_then_verified() {
+        let (mut engine, script) = scripted_engine(|_| {});
+        type_privet_and_space(&mut engine);
+        assert_eq!(
+            script.borrow().calls,
+            ["switch kbd0 1", "type 7 \"привет \" 0", "read kbd0"]
+        );
+        assert_eq!(engine.last_lang, Some(Lang::Ru));
+    }
+
+    #[test]
+    fn switch_is_repeated_until_the_layout_reads_back() {
+        let (mut engine, script) = scripted_engine(|_| {});
+        script.borrow_mut().keymaps = [english(), english(), Ok(Some("Russian".into()))].into();
+        type_privet_and_space(&mut engine);
+        assert_eq!(
+            script.borrow().calls,
+            [
+                "switch kbd0 1",
+                "type 7 \"привет \" 0",
+                "read kbd0",
+                "sleep 50",
+                "switch kbd0 1",
+                "read kbd0",
+                "sleep 50",
+                "switch kbd0 1",
+                "read kbd0",
+            ]
+        );
+        assert_eq!(engine.last_lang, Some(Lang::Ru));
+    }
+
+    #[test]
+    fn gives_up_after_the_configured_retries_without_claiming_success() {
+        let (mut engine, script) = scripted_engine(|cfg| cfg.timing.layout_switch_retries = 1);
+        script.borrow_mut().keymaps = [english(), english(), english()].into();
+        type_privet_and_space(&mut engine);
+        let switches = script
+            .borrow()
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("switch"))
+            .count();
+        assert_eq!(switches, 2); // the first attempt plus one retry
+        // The layout never changed, so the engine mustn't pretend it did.
+        assert_eq!(engine.last_lang, Some(Lang::En));
+    }
+
+    #[test]
+    fn an_unreadable_layout_is_trusted_without_retrying() {
+        let (mut engine, script) = scripted_engine(|_| {});
+        script.borrow_mut().keymaps = [Err(anyhow::anyhow!("socket closed"))].into();
+        type_privet_and_space(&mut engine);
+        assert!(!script.borrow().calls.iter().any(|c| c.starts_with("sleep")));
+        assert_eq!(engine.last_lang, Some(Lang::Ru));
+    }
+
+    #[test]
+    fn failed_typing_puts_the_layout_back() {
+        let (mut engine, script) = scripted_engine(|_| {});
+        script.borrow_mut().fail_type = true;
+        type_privet_and_space(&mut engine);
+        assert_eq!(
+            script.borrow().calls,
+            ["switch kbd0 1", "type 7 \"привет \" 0", "switch kbd0 0"]
+        );
+        assert_eq!(engine.last_lang, Some(Lang::En));
+        // The text was left alone, so it is still what was typed - and still
+        // flippable by hand.
+        assert_eq!(engine.last_word.unwrap().lang_on_screen, Lang::En);
+    }
+
+    #[test]
+    fn configured_delays_are_applied_in_order() {
+        let (mut engine, script) = scripted_engine(|cfg| {
+            cfg.timing.delay_after_layout_switch_ms = 10;
+            cfg.timing.delay_before_retype_ms = 20;
+        });
+        type_privet_and_space(&mut engine);
+        assert_eq!(
+            script.borrow().calls,
+            [
+                "switch kbd0 1",
+                "sleep 10",
+                "type 7 \"привет \" 20",
+                "read kbd0"
+            ]
+        );
+    }
+
+    #[test]
+    fn manual_flip_goes_through_the_same_sequence() {
+        let (mut engine, script) = scripted_engine(|_| {});
+        let typed = keys(&PRIVET);
+        let flipped_to = engine.flip_and_retype(&typed, Lang::En, 1, "kbd");
+        assert_eq!(flipped_to, Some(Lang::Ru));
+        assert_eq!(
+            script.borrow().calls,
+            ["switch kbd0 1", "type 7 \"привет \" 0", "read kbd0"]
+        );
+    }
+
+    #[test]
+    fn click_drops_the_word_being_typed() {
+        let mut cfg = Config::default();
+        cfg.general.eager_correction = false;
+        let mut engine = Engine::new(cfg);
+        engine.last_lang = Some(Lang::En);
+        for code in [KeyCode::KEY_G, KeyCode::KEY_H, KeyCode::KEY_B] {
+            tap(&mut engine, code);
+        }
+        assert_eq!(engine.buffer.len(), 3);
+        tap(&mut engine, KeyCode::BTN_LEFT);
+        assert!(engine.buffer.is_empty());
+    }
+
+    #[test]
+    fn click_drops_the_last_completed_word() {
+        let mut engine = Engine::new(Config::default());
+        engine.last_lang = Some(Lang::En);
+        for code in [KeyCode::KEY_Q, KeyCode::KEY_X, KeyCode::KEY_Z] {
+            tap(&mut engine, code);
+        }
+        tap(&mut engine, KeyCode::KEY_SPACE);
+        assert!(engine.last_word.is_some());
+        tap(&mut engine, KeyCode::BTN_RIGHT);
+        // Without this a double-Shift would flip text at the old position.
+        assert!(engine.last_word.is_none());
+    }
+
+    #[test]
+    fn button_release_alone_does_not_reset() {
+        let mut cfg = Config::default();
+        cfg.general.eager_correction = false;
+        let mut engine = Engine::new(cfg);
+        engine.last_lang = Some(Lang::En);
+        tap(&mut engine, KeyCode::KEY_Q);
+        engine.handle_key("mouse", KeyCode::BTN_LEFT, UP);
+        assert_eq!(engine.buffer.len(), 1);
+    }
+
+    #[test]
+    fn every_pointer_button_resets_and_keys_do_not() {
+        for code in [
+            KeyCode::BTN_LEFT,
+            KeyCode::BTN_RIGHT,
+            KeyCode::BTN_MIDDLE,
+            KeyCode::BTN_SIDE,
+            KeyCode::BTN_EXTRA,
+            KeyCode::BTN_TOUCH,
+        ] {
+            assert!(is_pointer_button(code), "{code:?}");
+        }
+        assert!(!is_pointer_button(KeyCode::KEY_A));
+        assert!(!is_pointer_button(KeyCode::KEY_LEFTSHIFT));
+    }
+
+    #[test]
+    fn click_between_two_shift_taps_is_not_a_double_tap() {
+        let mut engine = Engine::new(Config::default());
+        engine.last_lang = Some(Lang::En);
+        for code in [KeyCode::KEY_Q, KeyCode::KEY_X, KeyCode::KEY_Z] {
+            tap(&mut engine, code);
+        }
+        tap(&mut engine, KeyCode::KEY_LEFTSHIFT);
+        assert!(engine.manual_correct_last_tap.is_some());
+        tap(&mut engine, KeyCode::BTN_LEFT);
+        assert!(engine.manual_correct_last_tap.is_none());
+    }
+
+    #[test]
+    fn click_during_pause_chord_cancels_it() {
+        let mut engine = Engine::new(Config::default());
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, DOWN);
+        tap(&mut engine, KeyCode::BTN_LEFT);
+        engine.handle_key("kbd", KeyCode::KEY_LEFTSHIFT, UP);
+        engine.handle_key("kbd", KeyCode::KEY_RIGHTSHIFT, UP);
+        assert!(!engine.paused);
     }
 
     #[test]
