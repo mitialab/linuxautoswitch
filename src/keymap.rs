@@ -78,7 +78,7 @@ fn table(key: KeyCode) -> Option<(char, char, char, char)> {
     })
 }
 
-/// True for the 33 physical keys that form a letter in at least one of the
+/// True for the 34 physical keys that form a letter in at least one of the
 /// two layouts (and therefore should extend the in-progress word buffer
 /// instead of ending it).
 pub fn is_word_key(key: KeyCode) -> bool {

@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::keymap::{self, Lang};
 use crate::{control, dictionary, hypr, steam, typer};
 use evdev::KeyCode;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
@@ -73,6 +73,10 @@ pub struct Engine {
     /// Currently held modifier keys, as `LEFT_SHIFT | ...` bits.
     modifiers: u8,
     capslock: bool,
+    /// Keyboards that report their Caps Lock LED. For these, `capslock`
+    /// follows the LED instead of counting Caps key presses, because the key
+    /// does not always lock case (e.g. xkb `caps:hyper` turns it into Hyper).
+    led_devices: HashSet<String>,
     /// Hyprland address of the focused window.
     current_window: String,
     /// Cached exclusion check (window class + Steam detection) for the
@@ -156,6 +160,7 @@ impl Engine {
             manually_flipped: false,
             modifiers: 0,
             capslock: false,
+            led_devices: HashSet::new(),
             current_window,
             excluded,
             paused,
@@ -174,6 +179,14 @@ impl Engine {
         };
         engine.refresh_keyboards();
         engine
+    }
+
+    /// Records the Caps Lock LED state reported by `source_device`. The LED
+    /// is what the compositor actually applies, so it stays correct when the
+    /// Caps key is remapped (`caps:hyper`, `caps:escape`, ...).
+    pub fn set_capslock_led(&mut self, source_device: &str, on: bool) {
+        self.led_devices.insert(source_device.to_string());
+        self.capslock = on;
     }
 
     /// Re-reads Hyprland's keyboard list, e.g. after a keyboard is plugged
@@ -283,7 +296,7 @@ impl Engine {
             return;
         }
         if code == KeyCode::KEY_CAPSLOCK {
-            if value == 1 {
+            if value == 1 && !self.led_devices.contains(source_device) {
                 self.capslock = !self.capslock;
             }
             return;
@@ -973,9 +986,61 @@ mod tests {
         assert_eq!(engine.buffer.len(), 3);
     }
 
+    /// Types `g h j k` (lowercase) after a Caps key press and returns what a
+    /// manual flip would retype.
+    fn flip_after_caps_press(engine: &mut Engine) -> String {
+        engine.handle_key("kbd", KeyCode::KEY_CAPSLOCK, DOWN);
+        engine.handle_key("kbd", KeyCode::KEY_CAPSLOCK, 0);
+        for code in [
+            KeyCode::KEY_G,
+            KeyCode::KEY_H,
+            KeyCode::KEY_J,
+            KeyCode::KEY_K,
+        ] {
+            engine.handle_key("kbd", code, DOWN);
+            engine.handle_key("kbd", code, 0);
+        }
+        flipped(&engine.buffer, Lang::En).unwrap().0
+    }
+
+    fn no_eager_engine() -> Engine {
+        let mut cfg = Config::default();
+        cfg.general.eager_correction = false;
+        Engine::new(cfg)
+    }
+
+    #[test]
+    fn caps_key_without_led_still_toggles_case() {
+        // Keyboards that never report a Caps Lock LED keep the old behavior.
+        let mut engine = no_eager_engine();
+        assert_eq!(flip_after_caps_press(&mut engine), "ПРОЛ");
+    }
+
+    #[test]
+    fn caps_key_remapped_away_does_not_uppercase() {
+        // With xkb `caps:hyper` the Caps key never locks case, so the LED
+        // stays off and pressing the key must not make later text uppercase.
+        let mut engine = no_eager_engine();
+        engine.set_capslock_led("kbd", false);
+        assert_eq!(flip_after_caps_press(&mut engine), "прол");
+    }
+
+    #[test]
+    fn capslock_follows_the_led() {
+        let mut engine = no_eager_engine();
+        engine.set_capslock_led("kbd", true);
+        assert!(engine.capslock);
+        engine.set_capslock_led("kbd", false);
+        assert!(!engine.capslock);
+    }
+
     #[test]
     fn autorepeat_backspace_keeps_deleting() {
-        let mut engine = Engine::new(Config::default());
+        // "ghbd" is "прив" on the Russian layout, a dictionary word, so eager
+        // correction would fire on the 4th key and empty the buffer.
+        let mut cfg = Config::default();
+        cfg.general.eager_correction = false;
+        let mut engine = Engine::new(cfg);
         for code in [
             KeyCode::KEY_G,
             KeyCode::KEY_H,
