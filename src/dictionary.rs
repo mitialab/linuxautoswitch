@@ -9,7 +9,9 @@
 //! indefinitely, not a short-lived CLI tool.
 
 use crate::keymap::Lang;
-use fst::Set;
+use fst::automaton::{Automaton, Str};
+use fst::{IntoStreamer, Set, Streamer};
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 static EN_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/en.fst"));
@@ -26,13 +28,45 @@ fn ru() -> &'static Set<&'static [u8]> {
     RU_SET.get_or_init(|| Set::new(RU_BYTES).expect("embedded ru.fst is a valid fst::Set"))
 }
 
+fn lowered(word: &str) -> Cow<'_, str> {
+    // Borrow instead of allocating when there's nothing to lowercase, which
+    // is the common case for typed words - these run on every keystroke
+    // under eager correction.
+    if word.chars().any(char::is_uppercase) {
+        Cow::Owned(word.to_lowercase())
+    } else {
+        Cow::Borrowed(word)
+    }
+}
+
+fn set(lang: Lang) -> &'static Set<&'static [u8]> {
+    match lang {
+        Lang::En => en(),
+        Lang::Ru => ru(),
+    }
+}
+
 /// Whether `word` is a known word in `lang`. Case-insensitive.
 pub fn contains(lang: Lang, word: &str) -> bool {
-    let lower = word.to_lowercase();
-    match lang {
-        Lang::En => en().contains(lower.as_bytes()),
-        Lang::Ru => ru().contains(lower.as_bytes()),
+    set(lang).contains(lowered(word).as_bytes())
+}
+
+/// Whether some known word in `lang` is strictly longer than `prefix` and
+/// starts with it - i.e. whether someone typing `prefix` may simply not be
+/// finished yet. Case-insensitive.
+pub fn has_longer_word(lang: Lang, prefix: &str) -> bool {
+    let prefix = lowered(prefix);
+    let mut stream = set(lang)
+        .search(Str::new(&prefix).starts_with())
+        .into_stream();
+    // Keys come out in order, so the exact word (if it is one) is first and
+    // anything after it is longer: this loop runs at most twice.
+    while let Some(key) = stream.next() {
+        if key.len() > prefix.len() {
+            return true;
+        }
     }
+    false
 }
 
 #[cfg(test)]
@@ -66,5 +100,16 @@ mod tests {
     fn unknown_words() {
         assert!(!contains(Lang::En, "ghbdtn"));
         assert!(!contains(Lang::Ru, "руддщ"));
+    }
+
+    #[test]
+    fn longer_words_are_found_by_prefix() {
+        assert!(has_longer_word(Lang::En, "blen")); // blend
+        assert!(has_longer_word(Lang::En, "BLEN"));
+        assert!(has_longer_word(Lang::Ru, "прив")); // привет
+        // A complete word with no extension has nothing longer.
+        assert!(!has_longer_word(Lang::En, "zyzzyvas"));
+        assert!(!has_longer_word(Lang::En, "ghbdtn"));
+        assert!(!has_longer_word(Lang::Ru, "руддщ"));
     }
 }

@@ -41,9 +41,9 @@ exclude_steam_games = true
 # Check for a correction after every keystroke instead of only at word
 # boundaries (space/enter/tab/...). Needed for e.g. a browser address bar,
 # where you type a URL and press Enter immediately rather than a space.
-# Can very occasionally fire a beat early on a partial word that
-# coincidentally spells a real word in the other language - see the
-# README's "Known limitations" section.
+# A mid-word check holds back while what you typed is the start of a longer
+# word in the active layout (it is probably still being typed); the Space
+# check still covers it. See the README's "Known limitations" section.
 eager_correction = true
 
 # Minimum length for an eager (mid-word) correction. Kept higher than
@@ -51,6 +51,15 @@ eager_correction = true
 # buffer here might just be the first letters of a longer word still being
 # typed - not enough to trust yet.
 eager_min_word_length = 4
+
+# Also listen to mice, touchpads and touchscreens - button presses only, never
+# movement - so a click, which moves the cursor away from the word you were
+# typing, drops that word instead of letting a later correction delete text
+# at the wrong place. Set to false if you'd rather the daemon open keyboards
+# only. A touchpad touch counts too (tap-to-click never shows up as a real
+# button on the raw device), so a palm resting on the pad can occasionally
+# cost you a missed correction mid-word - never a wrong one.
+reset_on_click = true
 
 [layouts]
 # Substrings (case-insensitive) matched against Hyprland's `active_keymap`
@@ -89,3 +98,22 @@ manual_correct_window_ms = 400
 # already paused or on an excluded window - it's the way out. Same effect
 # as `linuxautoswitch toggle` from a shell.
 toggle_pause_keys = ["leftshift", "rightshift"]
+
+[timing]
+# How a correction is carried out. The layout is switched first, then the
+# fix is typed, then the layout is read back from Hyprland. The delays default
+# to 0 on purpose: the daemon only reads your keys, it cannot hold them back,
+# so every millisecond spent waiting is time in which what you type next
+# reaches the application ahead of the fix. Raise one only for an app that
+# visibly loses the start of a retyped word.
+
+# Pause between switching the layout and typing the fix.
+delay_after_layout_switch_ms = 0
+
+# Pause between the Backspaces and the retyped word.
+delay_before_retype_ms = 0
+
+# If the layout read back isn't the one asked for, repeat the switch this
+# many times (0 = never repeat), waiting this long before each repeat.
+layout_switch_retries = 2
+layout_switch_retry_delay_ms = 50

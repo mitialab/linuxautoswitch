@@ -129,8 +129,11 @@ pub enum HyprEvent {
 pub fn listen<T: From<HyprEvent> + Send + 'static>(tx: Sender<T>) {
     thread::spawn(move || {
         loop {
-            if let Err(e) = connect_and_listen(&tx) {
-                tracing::warn!("hyprland event socket error: {e:#}; retrying in 2s");
+            match connect_and_listen(&tx) {
+                // `Ok` means the daemon's event channel is closed (shutdown
+                // in progress) - reconnecting would just spin forever.
+                Ok(()) => return,
+                Err(e) => tracing::warn!("hyprland event socket error: {e:#}; retrying in 2s"),
             }
             thread::sleep(Duration::from_secs(2));
         }

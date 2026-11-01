@@ -25,7 +25,7 @@ if ! id -nG "$USER" | tr ' ' '\n' | grep -qx input; then
 fi
 
 echo "==> Building release binary"
-cargo build --release
+cargo build --release --locked
 
 echo "==> Installing"
 install -Dm755 target/release/linuxautoswitch "$BIN_DIR/linuxautoswitch"

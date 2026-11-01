@@ -43,11 +43,13 @@ word is retyped.
    punctuation, arrows) just reset the word-tracking state without
    rechecking it, since the eager check already had every chance to catch
    it and by then the app has typically already acted on that key anyway.
-3. If so: delete what was typed (plus the space, if a space triggered the
-   check), switch the active layout via Hyprland's
-   `switchxkblayout`, and retype the corrected word - via Wayland's virtual
-   keyboard protocol (`wtype`), so it never sees its own corrections as new
-   input.
+3. If so: switch the active layout via Hyprland's `switchxkblayout` (first,
+   so anything you type while the fix runs already comes out in the right
+   layout), delete what was typed (plus the space, if a space triggered the
+   check), and retype the corrected word - via Wayland's virtual keyboard
+   protocol (`wtype`), so it never sees its own corrections as new input.
+   Afterwards the layout is read back from Hyprland and the switch repeated
+   if it didn't take; if typing itself fails, the layout is put back.
 4. Automatic detection only fires when it can find the word in one
    dictionary but not the other - names, jargon, and anything not in either
    dictionary go untouched. For those, a manual hotkey (default:
@@ -149,6 +151,20 @@ Key settings:
   (`eager_min_word_length`, default 4) since a short one might just be the
   first letters of something longer. Single-letter words are never
   corrected, regardless of either setting.
+- `general.reset_on_click` - also watch mice, touchpads and touchscreens
+  (button presses only, never movement) and forget the word being typed on
+  every click, because a click moves the cursor away from it (on by default).
+  Touchpad touches count too, since tap-to-click is synthesized by libinput
+  and never appears as a real button on the raw device; the price is that a
+  resting palm can cost a missed correction mid-word, never a wrong one.
+- `timing.*` - how a correction is carried out: the layout is switched
+  first, the fix typed next, the layout read back last and re-switched up to
+  `layout_switch_retries` times (default 2, `layout_switch_retry_delay_ms`
+  apart) if it didn't take. `delay_after_layout_switch_ms` and
+  `delay_before_retype_ms` default to 0 on purpose - the daemon can't hold
+  your keys back, so any wait only lets what you type next reach the app
+  ahead of the fix - and exist for apps that visibly lose the start of a
+  retyped word.
 - `layouts.english_index` / `russian_index` - must match the order of
   `kb_layout` in your Hyprland config (e.g. `kb_layout = us,ru` means
   `english_index = 0`, `russian_index = 1`)
@@ -269,17 +285,23 @@ and reference `"custom/linuxautoswitch"` in one of the bar's module lists.
   auto-detection guesses the wrong device.
 - No per-application layout memory (Caramba's other headline feature) - this
   focuses purely on wrong-layout typo correction. Could be added later.
-- With `eager_correction` on, a correction can very occasionally fire a beat
-  early, mid-word: if a partial word you're still typing happens to
-  coincidentally spell a complete real word in the other language, it gets
-  corrected right then rather than once you finish typing. In practice this
-  is self-correcting (the layout gets switched either way, so the rest of
-  the word still comes out right) unless the coincidence happens to be a
-  real word in the *other* language while you're still mid-word in the
-  *currently active* one - rare, but possible with a 1.5M-entry Russian
-  dictionary. Raise `eager_min_word_length`, or turn `eager_correction` off
-  to fall back to boundary-only correction, if this happens often enough to
-  bother you.
+- With `eager_correction` on, a mid-word check holds back while the text you
+  have typed is not a word in the active layout but *is* the start of a
+  longer one (typing `blen` on the English layout, on the way to `blend`,
+  would otherwise read as the Russian word `идут`). Measured against the
+  bundled dictionaries this affects roughly 180 English and 60 Russian
+  prefixes in each direction, and costs about 0.01-0.02% of words their eager
+  correction: they are still corrected when you press Space, just not before
+  an Enter pressed straight after the word. A correction can still fire a
+  beat early the other way round - a partial word on the wrong layout that
+  already spells a complete word - which is self-correcting, since the layout
+  is switched either way. Raise `eager_min_word_length`, or turn
+  `eager_correction` off to fall back to boundary-only correction, if this
+  bothers you.
+- Cursor moves made without a click (keyboard shortcuts are already
+  handled; a touchscreen swipe, a pen, an app moving the caret itself) aren't
+  seen, so a word typed right before one can still be retyped in the wrong
+  place. Clicks are covered by `general.reset_on_click`.
 - The manual-flip hotkey only reaches back to the last word while the
   cursor is still right after it (plus any spaces). After Enter, Tab,
   punctuation, an arrow key or a focus change there's nothing to flip.
