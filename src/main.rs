@@ -100,6 +100,14 @@ fn init_logging() {
     }
 }
 
+/// A mouse, touchpad or touchscreen: anything with pointer buttons that
+/// isn't a keyboard. Only its button presses are ever forwarded.
+fn is_pointer(device: &evdev::Device) -> bool {
+    device
+        .supported_keys()
+        .is_some_and(|keys| keys.contains(KeyCode::BTN_LEFT) || keys.contains(KeyCode::BTN_TOUCH))
+}
+
 fn is_keyboard(device: &evdev::Device) -> bool {
     device
         .supported_keys()
@@ -115,8 +123,10 @@ const DEVICE_SCAN_INTERVAL: Duration = Duration::from_secs(2);
 type Seen = Arc<Mutex<HashSet<PathBuf>>>;
 
 /// Opens every input device that appeared since the last scan and starts a
-/// reader thread for each new keyboard. Returns how many were started.
-fn scan_devices(seen: &Seen, tx: &Sender<Event>) -> usize {
+/// reader thread for each new keyboard (and, with `watch_pointers`, each
+/// pointer device, which only reports button presses). Returns how many
+/// keyboards were started.
+fn scan_devices(seen: &Seen, tx: &Sender<Event>, watch_pointers: bool) -> usize {
     let present: HashSet<PathBuf> = match std::fs::read_dir("/dev/input") {
         Ok(dir) => dir
             .filter_map(Result::ok)
@@ -154,8 +164,10 @@ fn scan_devices(seen: &Seen, tx: &Sender<Event>) -> usize {
             }
         };
         if is_keyboard(&device) {
-            watch_device(path, device, seen.clone(), tx.clone());
+            watch_device(path, device, seen.clone(), tx.clone(), false);
             started += 1;
+        } else if watch_pointers && is_pointer(&device) {
+            watch_device(path, device, seen.clone(), tx.clone(), true);
         }
     }
     started
@@ -168,15 +180,24 @@ fn forget(seen: &Seen, path: &Path) {
 }
 
 /// Spawns a thread forwarding `device`'s key events until it's unplugged.
-fn watch_device(path: PathBuf, mut device: evdev::Device, seen: Seen, tx: Sender<Event>) {
+/// With `buttons_only`, anything but a pointer button press is dropped here,
+/// so a busy mouse doesn't flood the engine's channel.
+fn watch_device(
+    path: PathBuf,
+    mut device: evdev::Device,
+    seen: Seen,
+    tx: Sender<Event>,
+    buttons_only: bool,
+) {
     let name: Arc<str> = Arc::from(device.name().unwrap_or("unknown-keyboard"));
-    tracing::info!(path = %path.display(), name = %name, "watching keyboard device");
+    tracing::info!(path = %path.display(), name = %name, buttons_only, "watching input device");
     thread::spawn(move || {
         loop {
             match device.fetch_events() {
                 Ok(events) => {
                     for ev in events {
                         if let evdev::EventSummary::Key(_, code, value) = ev.destructure()
+                            && (!buttons_only || engine::is_pointer_button(code))
                             && tx
                                 .send(Event::Key {
                                     device: name.clone(),
@@ -293,7 +314,8 @@ fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     // One reader thread per physical keyboard device, including ones
     // plugged in later.
     let seen: Seen = Arc::default();
-    if scan_devices(&seen, &tx) == 0 {
+    let watch_pointers = cfg.general.reset_on_click;
+    if scan_devices(&seen, &tx, watch_pointers) == 0 {
         tracing::warn!(
             "no keyboard devices found under /dev/input - is this user in the `input` group?"
         );
@@ -301,7 +323,9 @@ fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     thread::spawn(move || {
         loop {
             thread::sleep(DEVICE_SCAN_INTERVAL);
-            if scan_devices(&seen, &tx) > 0 && tx.send(Event::KeyboardsChanged).is_err() {
+            if scan_devices(&seen, &tx, watch_pointers) > 0
+                && tx.send(Event::KeyboardsChanged).is_err()
+            {
                 return;
             }
         }
